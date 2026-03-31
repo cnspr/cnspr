@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="5" fill="#0f0f14"/>
+  <!-- Eye shape -->
+  <path d="M3 16 Q16 5 29 16 Q16 27 3 16Z" fill="#12121a" stroke="#7c5cbf" stroke-width="1.2"/>
+  <!-- Iris -->
+  <circle cx="16" cy="16" r="5.5" fill="#1a0d30"/>
+  <circle cx="16" cy="16" r="5.5" fill="none" stroke="#7c5cbf" stroke-width="1"/>
+  <!-- Inner glow ring -->
+  <circle cx="16" cy="16" r="3.8" fill="#2a1050" opacity="0.9"/>
+  <!-- Pupil -->
+  <circle cx="16" cy="16" r="2.2" fill="#0a0a12"/>
+  <!-- Accent dot -->
+  <circle cx="17.4" cy="14.6" r="0.9" fill="#9b7de0" opacity="0.85"/>
+  <!-- Corner nodes (conspiracy network) -->
+  <circle cx="5"  cy="5"  r="1.2" fill="#4a9eff" opacity="0.6"/>
+  <circle cx="27" cy="5"  r="1.2" fill="#4a9eff" opacity="0.6"/>
+  <circle cx="5"  cy="27" r="1.2" fill="#4a9eff" opacity="0.6"/>
+  <circle cx="27" cy="27" r="1.2" fill="#4a9eff" opacity="0.6"/>
+  <!-- Lines from corners toward eye -->
+  <line x1="5"  y1="5"  x2="11" y2="12" stroke="#4a9eff" stroke-width="0.6" opacity="0.35"/>
+  <line x1="27" y1="5"  x2="21" y2="12" stroke="#4a9eff" stroke-width="0.6" opacity="0.35"/>
+  <line x1="5"  y1="27" x2="11" y2="20" stroke="#4a9eff" stroke-width="0.6" opacity="0.35"/>
+  <line x1="27" y1="27" x2="21" y2="20" stroke="#4a9eff" stroke-width="0.6" opacity="0.35"/>
+</svg>

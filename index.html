@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Conspiracy</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Login screen (shown until auth completes) -->
+  <div id="login-screen" class="hidden">
+    <div class="setup-box">
+      <h2>Conspiracy</h2>
+      <label>Personal Access Token
+        <input id="pat-input" type="password" placeholder="ghp_…" autocomplete="off" />
+      </label>
+      <label>Mubert API Key <span style="color:var(--muted);font-weight:400">(optional — enables AI music)</span>
+        <input id="mubert-key-input" type="password" placeholder="mubert_…" autocomplete="off" />
+      </label>
+      <button id="btn-pat" class="primary">Connect</button>
+      <p class="hint">GitHub token needs <code>repo</code> scope. Generate at GitHub → Settings → Developer settings → Personal access tokens.</p>
+      <p id="login-error" class="error hidden"></p>
+    </div>
+  </div>
+
+  <!-- Main UI -->
+  <div id="app" class="hidden">
+    <header>
+      <span id="header-title">CONSPIRACY</span>
+      <span id="header-turn"></span>
+      <span id="header-trust"></span>
+      <div id="music-player">
+        <span id="music-title">♪ –</span>
+        <button id="btn-music-play" title="Play / Pause">▶</button>
+        <button id="btn-music-skip" title="Next track">▶▶</button>
+        <button id="btn-music-search" title="Music library / search">♫</button>
+      </div>
+      <div id="config-menu-wrap">
+        <button id="btn-config">⚙ Options</button>
+        <div id="config-menu" class="dropdown-menu hidden">
+          <button class="dropdown-item" id="cfg-reload">↻ Refresh world</button>
+          <button class="dropdown-item" id="cfg-new-turn">+ Create turn</button>
+          <button class="dropdown-item" id="cfg-setup">⊕ Setup / onboarding</button>
+          <button class="dropdown-item" id="cfg-music">♪ Music settings</button>
+          <hr class="dropdown-sep" />
+          <button class="dropdown-item" id="cfg-logout">⏏ Log out</button>
+        </div>
+      </div>
+      <button id="btn-debug" class="hidden">DBG</button>
+    </header>
+
+    <nav>
+      <button class="tab-btn active" data-tab="map">Map</button>
+      <button class="tab-btn" data-tab="events">Events</button>
+      <button class="tab-btn" data-tab="stats">Statistics</button>
+    </nav>
+
+    <!-- Map tab -->
+    <div id="tab-map" class="tab active">
+      <div id="map-toolbar">
+        <button class="map-view-btn active" data-view="political">Political</button>
+        <button class="map-view-btn" data-view="population">Population</button>
+        <button class="map-view-btn" data-view="unrest">Unrest</button>
+        <button class="map-view-btn" data-view="prosperity">Prosperity</button>
+      </div>
+      <canvas id="map-canvas"></canvas>
+      <div id="map-selection" class="map-selection">
+        <!-- Left panel: context-aware orders for the selected region -->
+        <div id="region-orders" class="map-side-panel map-side-panel--left">
+          <div id="wo-content"></div>
+          <div class="wo-submit-footer">
+            <div class="wi-section-title">Order Queue <span id="order-count">(0)</span></div>
+            <ul id="orders-list"></ul>
+            <div class="wo-submit-row">
+              <button id="btn-clear-orders">Clear</button>
+              <button id="btn-submit-orders" class="primary">Submit Turn (PR)</button>
+            </div>
+            <p id="orders-status"></p>
+          </div>
+        </div>
+        <!-- Right panel: region information -->
+        <div id="region-info" class="map-side-panel map-side-panel--right"></div>
+      </div>
+    </div>
+
+    <!-- Hidden form elements used internally by OrdersPanel -->
+    <div class="hidden">
+      <select id="order-type"></select>
+      <textarea id="order-params"></textarea>
+      <button id="btn-add-order"></button>
+    </div>
+
+    <!-- Events tab -->
+    <div id="tab-events" class="tab hidden">
+      <div class="events-toolbar">
+        <input id="events-filter" type="text" placeholder="Filter by faction, hero, region…" />
+      </div>
+      <ul id="events-list"></ul>
+    </div>
+
+    <!-- Statistics tab -->
+    <div id="tab-stats" class="tab hidden">
+      <div class="charts-grid">
+        <div class="chart-box"><canvas id="chart-trust"></canvas></div>
+        <div class="chart-box"><canvas id="chart-belief"></canvas></div>
+        <div class="chart-box"><canvas id="chart-army"></canvas></div>
+        <div class="chart-box"><canvas id="chart-unrest"></canvas></div>
+      </div>
+    </div>
+
+    <!-- Setup tab -->
+    <div id="tab-setup" class="tab hidden">
+      <div class="setup-steps">
+        <div class="setup-step">
+          <h3>Step 1 — Fork the canonical repo</h3>
+          <p>Creates your personal copy of the Conspiracy repository where your world will live.</p>
+          <button id="btn-fork">Fork Conspiracy</button>
+          <p id="fork-status" class="setup-step-status"></p>
+        </div>
+        <div class="setup-step">
+          <h3>Step 2 — Initialize your world</h3>
+          <p>Creates an initial world file on your fork (<code>{userid}/turn.json</code>).</p>
+          <button id="btn-init-world" disabled>Initialize World</button>
+          <p id="init-status" class="setup-step-status"></p>
+        </div>
+        <div class="setup-step">
+          <h3>Step 3 — Submit join PR</h3>
+          <p>Opens a pull request from your fork to the canonical repo so the game master can register you.</p>
+          <button id="btn-join-pr" disabled>Submit Join PR</button>
+          <p id="pr-status" class="setup-step-status"></p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Turn modal -->
+  <div id="create-turn-modal" class="modal-overlay hidden">
+    <div class="modal-box">
+      <h3>Create Turn</h3>
+      <p class="hint">Advance the world to the next turn and set a submission deadline.</p>
+      <label>Current turn
+        <input id="ct-current" type="text" readonly />
+      </label>
+      <label>Next turn
+        <input id="ct-next" type="text" readonly />
+      </label>
+      <label>Deadline (UTC)
+        <input id="ct-deadline" type="datetime-local" />
+      </label>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="ct-confirm" class="primary">Advance Turn</button>
+        <button id="ct-cancel">Cancel</button>
+      </div>
+      <p id="ct-status" class="hint" style="margin-top:6px"></p>
+    </div>
+  </div>
+
+  <!-- Hidden YouTube IFrame player container (replaced by YT API with an iframe) -->
+  <div id="yt-player-container" style="position:absolute;width:0;height:0;overflow:hidden;pointer-events:none"></div>
+
+  <!-- Music library / search modal -->
+  <div id="music-modal" class="modal-overlay hidden">
+    <div class="modal-box modal-box--wide">
+      <div class="mm-header">
+        <h3>Music Library</h3>
+        <span id="mm-mood-badge" class="mm-mood-badge"></span>
+        <button id="mm-close-btn" class="mm-x-btn">✕</button>
+      </div>
+
+      <div class="mm-tabs">
+        <button class="mm-tab active" data-mm-tab="saved">Saved tracks</button>
+        <button class="mm-tab" data-mm-tab="search">Search YouTube</button>
+      </div>
+
+      <!-- Saved tracks pane -->
+      <div id="mm-pane-saved" class="mm-pane">
+        <div class="mm-pane-toolbar">
+          <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)">
+            Mood
+            <select id="mm-mood-select" style="font-size:11px"></select>
+          </label>
+          <button id="mm-sync-gh" title="Sync library to GitHub fork">↑ Sync to GitHub</button>
+        </div>
+        <div id="mm-saved-list"></div>
+      </div>
+
+      <!-- Search pane -->
+      <div id="mm-pane-search" class="mm-pane hidden">
+        <div class="mm-search-row">
+          <input id="mm-search-input" type="text" placeholder="Search YouTube for music…" />
+          <select id="mm-search-mood-select" style="font-size:11px"></select>
+          <button id="mm-search-btn" class="primary">Search</button>
+        </div>
+        <p id="mm-search-note" class="hint"></p>
+        <div id="mm-search-results"></div>
+      </div>
+
+      <div class="mm-footer">
+        <span id="mm-status" class="hint"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Music settings modal -->
+  <div id="music-settings-modal" class="modal-overlay hidden">
+    <div class="modal-box">
+      <h3>Music Settings</h3>
+      <label>Music source
+        <select id="ms-mode">
+          <option value="procedural">Procedural (Mubert / Web Audio fallback)</option>
+          <option value="youtube">YouTube playlist</option>
+          <option value="mp3">YouTube → MP3 via extract service</option>
+        </select>
+      </label>
+      <label>YouTube Data API Key <span style="color:var(--muted);font-weight:400">(enables library search)</span>
+        <input id="ms-yt-key" type="password" placeholder="AIzaSy…" autocomplete="off" />
+      </label>
+      <label>MP3 Extract Service URL <span style="color:var(--muted);font-weight:400">(MP3 mode only)</span>
+        <input id="ms-mp3-url" type="text" placeholder="https://your-yt-dlp-server.example.com" />
+      </label>
+      <label style="flex-direction:row;align-items:center;gap:8px;flex-wrap:wrap">
+        <input id="ms-autosave" type="checkbox" style="width:auto;margin:0" />
+        Auto-save tracks played past
+        <input id="ms-autosave-pct" type="number" min="0" max="100" value="80"
+               style="width:56px;padding:3px 6px;font-size:12px" />%
+      </label>
+      <p class="hint" style="margin-top:-4px">
+        Tracks played past the threshold without being skipped are saved to your library automatically.
+      </p>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="ms-save" class="primary">Save &amp; reload</button>
+        <button id="ms-cancel">Cancel</button>
+      </div>
+      <p id="ms-status" class="hint" style="margin-top:6px"></p>
+    </div>
+  </div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
