@@ -3,7 +3,7 @@
  * Wires together config, GitHub client, and all UI panels.
  */
 
-alert(1)
+debugger;
 import { Config }       from './config.js';
 import { GitHubClient, AuthError } from './github.js';
 import { MusicPlayer, MOODS }  from './musicplayer.js';
@@ -82,7 +82,7 @@ function showLogin(errorMsg) {
         headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
       }).then(r => r.ok ? r.json() : Promise.reject(new Error('Invalid token')));
 
-      cfg = { userid: me.login, github_token: token, github_repo: `${me.login}/conspiracy`, ...(mubertKey ? { mubert_api_key: mubertKey } : {}) };
+      cfg = { userid: me.login, github_token: token, github_repo: `${me.login}/world`, ...(mubertKey ? { mubert_api_key: mubertKey } : {}) };
       Config.save(cfg);
       dbg.info('PAT login successful', { userid: cfg.userid });
       initApp();
@@ -239,7 +239,7 @@ function initApp() {
     document.getElementById('map-canvas'),
     (region) => {
       if (region && world) {
-        regionInfoPanel.show(region, world);
+        regionInfoPanel.show(region, world, mapView.getAdjacentIds(region.id));
         regionOrdersPanel.show(region, world);
         mapSelectionEl.classList.add('open');
       } else {

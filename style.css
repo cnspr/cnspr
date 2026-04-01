@@ -14,6 +14,17 @@
   --good:     #27ae60;
   --font:     'Segoe UI', system-ui, sans-serif;
   --mono:     'Fira Code', 'Consolas', monospace;
+
+  /* ── Map canvas colours ─────────────────────────── */
+  --map-ocean:      #0a1020;
+  --map-land:       #1a2030;
+  --map-border:     #2a3548;
+  --map-border-hov: #4a6088;
+  --map-border-sel: #8090c8;
+
+  /* ── Faction colours ────────────────────────────── */
+  --faction-syndicate:  #e6a820;
+  --faction-conspiracy: #9b59b6;
 }
 
 body {

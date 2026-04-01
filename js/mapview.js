@@ -5,30 +5,33 @@
  *
  * Key behaviours:
  *  - Orthographic (globe) projection; drag rotates lon0/lat0
- *  - Region polygons are Voronoi cells built by half-plane intersection over the adjacency graph
+ *  - Delaunay triangulation computed from seed positions; Voronoi cells are its dual
+ *  - Adjacency derived from Delaunay triangulation (no adjacency lists in map.json)
  *  - Zoom range: 0.5 … 8 (scales globe radius)
  *  - Input: mouse wheel, trackpad/touch pinch, keyboard +/-, touch drag, tap-to-select
  *  - devicePixelRatio-aware canvas sizing (§4.3)
  */
-// (No external imports — Voronoi cells are built from the adjacency graph in map.json)
+// (No external imports — Voronoi cells built from seed positions via Delaunay triangulation)
 
-// ── Colours ──────────────────────────────────────────────────────────────────
+// ── Colours (read from CSS custom properties defined in style.css) ───────────
+
+const _css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 
 const FACTION_COLORS = {
-  federation: '#4a9eff',
-  syndicate:  '#e6a820',
-  conspiracy: '#9b59b6',
+  federation: _css('--accent2'),
+  syndicate:  _css('--faction-syndicate'),
+  conspiracy: _css('--faction-conspiracy'),
 };
-const COL_OCEAN      = '#0a1020';
-const COL_LAND_DEF   = '#1a2030';
-const COL_BORDER     = '#2a3548';
-const COL_BORDER_HOV = '#4a6088';
-const COL_BORDER_SEL = '#8090c8';
-const COL_TEXT       = '#d4d4e8';
-const COL_MUTED      = '#6878a0';
-const COL_UNREST_LO  = '#27ae60';
-const COL_UNREST_MD  = '#e67e22';
-const COL_UNREST_HI  = '#c0392b';
+const COL_OCEAN      = _css('--map-ocean');
+const COL_LAND_DEF   = _css('--map-land');
+const COL_BORDER     = _css('--map-border');
+const COL_BORDER_HOV = _css('--map-border-hov');
+const COL_BORDER_SEL = _css('--map-border-sel');
+const COL_TEXT       = _css('--text');
+const COL_MUTED      = _css('--muted');
+const COL_UNREST_LO  = _css('--good');
+const COL_UNREST_MD  = _css('--warn');
+const COL_UNREST_HI  = _css('--danger');
 
 function unrestColor(u) {
   if (u > 60) return COL_UNREST_HI;
@@ -37,142 +40,280 @@ function unrestColor(u) {
 }
 
 // ── Region seeds, keys, and cell polygons ─────────────────────────────────────
-// All region seeds (lon, lat) and the adjacency graph come from map.json.
-// No hardcoded coordinate table exists here.
-
-// Load all region seeds and adjacency graph from map.json.
 // Keys: reg_* → strip "reg_" prefix; sea_* → kept as-is.
-// Sea regions are included as bisector seeds but excluded from rendering.
-const _MAP_DATA = await fetch('./world/map.json').then(r => r.json());
-const _toKey    = id => id.replace(/^reg_/, '');
-const _SEEDS    = new Map(_MAP_DATA.map(r => [_toKey(r.id), r]));
+// Geometry is built lazily from world.regions on first render() — no fetch needed.
+const _toKey = id => id.replace(/^reg_/, '');
 
-// Keys of renderable (non-sea) regions — derived from map.json, not a hardcoded table.
-const _GEO_KEYS = [..._SEEDS.keys()].filter(k => !k.startsWith('sea_'));
-
-// ── Voronoi cells (adjacency-graph half-plane intersection) ──────────────────
+// ── 3-D convex hull (= spherical Delaunay triangulation) ─────────────────────
 //
-// For each region seed p, clip the EA bounding box by the perpendicular bisector
-// between p and each adjacent seed. The resulting polygon is the set of EA points
-// closer to p than to any declared neighbour. Together the non-sea cells tile the
-// visible globe with no gaps.
-const _GEO_CELLS = (() => {
-  const EA_FWD = (lon, lat) => [lon, Math.sin(lat * Math.PI / 180)];
-  const EA_INV = (x, y)    => [x,   Math.asin(Math.max(-1, Math.min(1, y))) * 180 / Math.PI];
+// For points on the unit sphere, the 3-D convex hull faces ARE the Delaunay
+// triangles (Guibas & Stolfi 1985).  Each face's outward unit normal is the
+// corresponding Voronoi vertex on the sphere.
+//
+// Algorithm: randomised incremental insertion with conflict lists
+// (de Berg et al. "Computational Geometry" §11.2).
+// Expected O(n log n) time: each insertion touches O(1) amortised faces; the
+// shuffle ensures the random-order guarantee; conflict lists give O(1) look-up
+// of the visible face set per insertion.
+//
+// pts    : array of [x,y,z] unit vectors
+// returns: array of [i,j,k] index triples, CCW from outside (outward-facing)
+function _convexHull3D(pts) {
+  const n = pts.length;
+  if (n < 4) return [];
 
-  // Sutherland-Hodgman clip of an EA polygon to yMin ≤ y ≤ yMax.
-  function _clipEA(poly, yMin, yMax) {
-    let pts = poly;
-    // clip north: keep y ≤ yMax
-    {
-      const out = [];
-      for (let i = 0; i < pts.length; i++) {
-        const a = pts[i], b = pts[(i + 1) % pts.length];
-        if (a[1] <= yMax) out.push(a);
-        if ((a[1] <= yMax) !== (b[1] <= yMax)) {
-          const t = (yMax - a[1]) / (b[1] - a[1]);
-          out.push([a[0] + t * (b[0] - a[0]), yMax]);
+  // orient(a,b,c,d): signed volume of tet(a,b,c,d).
+  // Positive iff d is strictly above plane(a,b,c) — i.e. on the outward-normal side.
+  // Outward normal of face (a,b,c) = (b-a)×(c-a).
+  const orient = (a,b,c,d) => {
+    const pa=pts[a], pb=pts[b], pc=pts[c], pd=pts[d];
+    const ux=pb[0]-pa[0], uy=pb[1]-pa[1], uz=pb[2]-pa[2];
+    const vx=pc[0]-pa[0], vy=pc[1]-pa[1], vz=pc[2]-pa[2];
+    const wx=pd[0]-pa[0], wy=pd[1]-pa[1], wz=pd[2]-pa[2];
+    return ux*(vy*wz-vz*wy) - uy*(vx*wz-vz*wx) + uz*(vx*wy-vy*wx);
+  };
+
+  // Face: { v:[a,b,c], adj:[-1,-1,-1], pts:Set<ptIdx>, alive:bool }
+  //   v  : vertex indices, listed CCW from outside the hull
+  //   adj[e]: id of the face sharing edge (v[e] → v[(e+1)%3]);
+  //           that face stores the edge in the opposite direction
+  //   pts: conflict list — uninserted point indices visible from this face
+  const hull    = [];
+  const F       = id => hull[id];
+  const addF    = (a,b,c) => (hull.push({v:[a,b,c], adj:[-1,-1,-1], pts:new Set(), alive:true}), hull.length-1);
+  const link    = (fi,ei, fj,ej) => { F(fi).adj[ei]=fj; F(fj).adj[ej]=fi; };
+  const edgeOf  = (fi,u,v) => { const w=F(fi).v; for(let e=0;e<3;e++) if(w[e]===u&&w[(e+1)%3]===v)return e; return -1; };
+  const visible = (fi,q)   => orient(F(fi).v[0], F(fi).v[1], F(fi).v[2], q) > 1e-10;
+
+  // ── Step 1: Initial tetrahedron ────────────────────────────────────────────
+  // Find four non-coplanar seeds to start with.
+  let p0=0, p1=-1, p2=-1, p3=-1;
+  for (let i=1; i<n&&p1<0; i++) {
+    const a=pts[0], b=pts[i];
+    if ((a[0]-b[0])**2+(a[1]-b[1])**2+(a[2]-b[2])**2 > 1e-8) p1=i;
+  }
+  if (p1<0) return [];
+  for (let i=0; i<n&&p2<0; i++) {
+    if (i===p0||i===p1) continue;
+    const [ax,ay,az]=pts[p0], [bx,by,bz]=pts[p1], [cx,cy,cz]=pts[i];
+    const nx=(by-ay)*(cz-az)-(bz-az)*(cy-ay);
+    const ny=(bz-az)*(cx-ax)-(bx-ax)*(cz-az);
+    const nz=(bx-ax)*(cy-ay)-(by-ay)*(cx-ax);
+    if (nx*nx+ny*ny+nz*nz > 1e-8) p2=i;
+  }
+  if (p2<0) return [];
+  for (let i=0; i<n&&p3<0; i++) {
+    if (i===p0||i===p1||i===p2) continue;
+    if (Math.abs(orient(p0,p1,p2,i)) > 1e-8) p3=i;
+  }
+  if (p3<0) return [];
+
+  // Four faces of the tetrahedron; fix winding so the opposite vertex is interior.
+  const tet = [addF(p0,p1,p2), addF(p0,p1,p3), addF(p0,p2,p3), addF(p1,p2,p3)];
+  const opp = [p3, p2, p1, p0];  // vertex opposite to each face
+  for (let i=0; i<4; i++) {
+    // If the opposite vertex is visible (above), the winding is inside-out — flip.
+    if (visible(tet[i], opp[i])) { const w=F(tet[i]).v; [w[1],w[2]]=[w[2],w[1]]; }
+  }
+  // Link each pair of tetrahedron faces across their shared edge.
+  for (let i=0; i<4; i++) for (let j=i+1; j<4; j++) {
+    for (let e=0; e<3; e++) {
+      const u=F(tet[i]).v[e], v=F(tet[i]).v[(e+1)%3];
+      const ej=edgeOf(tet[j],v,u);  // the shared edge runs opposite in the neighbour
+      if (ej>=0) { link(tet[i],e,tet[j],ej); break; }
+    }
+  }
+
+  // ── Step 2: Initialise conflict lists ─────────────────────────────────────
+  // pConfl[pt] = Set<faceId> — faces visible from pt (not yet inserted)
+  // F(fi).pts  = Set<pt>     — uninserted points that see face fi
+  const tetSet = new Set([p0,p1,p2,p3]);
+  const rest   = Array.from({length:n}, (_,i)=>i).filter(i=>!tetSet.has(i));
+  const pConfl = new Map();
+  for (const pt of rest) {
+    const s = new Set();
+    for (const fi of tet) if (visible(fi,pt)) { s.add(fi); F(fi).pts.add(pt); }
+    pConfl.set(pt, s);
+  }
+
+  // ── Step 3: Randomised incremental insertion ───────────────────────────────
+  for (let i=rest.length-1; i>0; i--) {
+    const j=(Math.random()*(i+1))|0; [rest[i],rest[j]]=[rest[j],rest[i]];
+  }
+
+  for (const pt of rest) {
+    const seed = pConfl.get(pt);
+    if (!seed || seed.size===0) continue;  // interior point (cannot happen on sphere)
+
+    // BFS from conflict-list seed to collect all visible faces.
+    // The conflict list gives the starting set; BFS catches any neighbours missed
+    // by floating-point edge cases.
+    const visFids = new Set(seed);
+    const queue   = [...seed];
+    while (queue.length) {
+      const fi=queue.pop();
+      for (let e=0; e<3; e++) {
+        const fj=F(fi).adj[e];
+        if (fj>=0 && !visFids.has(fj) && F(fj).alive && visible(fj,pt)) {
+          visFids.add(fj); queue.push(fj);
         }
       }
-      pts = out;
     }
-    // clip south: keep y ≥ yMin
-    {
-      const out = [];
-      for (let i = 0; i < pts.length; i++) {
-        const a = pts[i], b = pts[(i + 1) % pts.length];
-        if (a[1] >= yMin) out.push(a);
-        if ((a[1] >= yMin) !== (b[1] >= yMin)) {
-          const t = (yMin - a[1]) / (b[1] - a[1]);
-          out.push([a[0] + t * (b[0] - a[0]), yMin]);
-        }
-      }
-      pts = out;
-    }
-    return pts;
-  }
 
-  // Build a spherical cap polygon in lon/lat by densely sampling the boundary
-  // latitude circle (every 2° lon) then closing through the pole.
-  function _capPoly(capLat, poleLat) {
-    const pts = [];
-    for (let lon = -180; lon <= 180; lon += 2) pts.push([lon, capLat]);
-    pts.push([180, poleLat]);
-    pts.push([-180, poleLat]);
-    pts.push([-180, capLat]);
-    return _subdividePoly(pts);
-  }
-
-  // Clip poly to the half-plane closer to (ax, ay) than to (bx, by) in EA space.
-  // Adjusts bx to take the shorter path across the antimeridian when needed.
-  // If the adjusted path still spans >180°, the bisector falls outside the bounding
-  // box and the clip is skipped (poly returned unchanged).
-  function _clipHalfPlane(poly, ax, ay, bx, by) {
-    if (bx - ax > 180) bx -= 360;
-    else if (bx - ax < -180) bx += 360;
-    if (Math.abs(bx - ax) > 180) return poly;
-    const mx = (ax + bx) / 2, my = (ay + by) / 2;
-    const nx = bx - ax, ny = by - ay;
-    const inside = (px, py) => (px - mx) * nx + (py - my) * ny <= 0;
-    const out = [];
-    for (let i = 0; i < poly.length; i++) {
-      const a = poly[i], b = poly[(i + 1) % poly.length];
-      const aIn = inside(a[0], a[1]);
-      const bIn = inside(b[0], b[1]);
-      if (aIn) out.push(a);
-      if (aIn !== bIn) {
-        const denom = (b[0] - a[0]) * nx + (b[1] - a[1]) * ny;
-        if (Math.abs(denom) > 1e-10) {
-          const t = ((mx - a[0]) * nx + (my - a[1]) * ny) / denom;
-          if (t > 0 && t < 1)
-            out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+    // Horizon: edges of visible faces whose opposite neighbour is non-visible (or absent).
+    const horizon = [];
+    for (const fi of visFids) {
+      for (let e=0; e<3; e++) {
+        const fj=F(fi).adj[e];
+        if (fj<0 || !visFids.has(fj)) {
+          const u=F(fi).v[e], v=F(fi).v[(e+1)%3];
+          horizon.push({u, v, fAdj:fj, eAdj: fj>=0 ? edgeOf(fj,v,u) : -1});
         }
       }
     }
-    return out;
-  }
 
-  // Non-polar cells are capped at these EA y values so no cell touches y=±1.
-  const MAX_Y_N = Math.sin(75 * Math.PI / 180);   //  sin(75°) ≈ 0.966
-  const MAX_Y_S = Math.sin(-60 * Math.PI / 180);  // sin(−60°) ≈ −0.866
+    // New cone face per horizon edge.
+    // Horizon edge (u→v) belongs to a visible face; the new face is (v,u,pt) — CCW from outside.
+    //   edge 0 = v→u  (base, links to fAdj)
+    //   edge 1 = u→pt
+    //   edge 2 = pt→v
+    const newFids = horizon.map(({u,v,fAdj,eAdj}) => {
+      const fi=addF(v,u,pt);
+      if (fAdj>=0 && eAdj>=0) link(fi,0,fAdj,eAdj);
+      return fi;
+    });
 
-  const cells = {};
-  for (const [key, region] of _SEEDS) {
-    if (key === 'arctic')     { cells[key] = _capPoly(75, 90);   continue; }
-    if (key === 'antarctica') { cells[key] = _capPoly(-60, -90); continue; }
-
-    let cell = [[-180, -1], [180, -1], [180, 1], [-180, 1]];
-    const [ax, ay] = EA_FWD(region.lon, region.lat);
-
-    for (const adjId of (region.adjacent_region_ids ?? [])) {
-      const adj = _SEEDS.get(_toKey(adjId));
-      if (!adj) continue;
-      const [bx, by] = EA_FWD(adj.lon, adj.lat);
-      cell = _clipHalfPlane(cell, ax, ay, bx, by);
-      if (cell.length < 3) break;
+    // Link cone faces to each other around pt.
+    // Face A (v_A, u_A, pt): edge 1=(u_A→pt) links to edge 2=(pt→v_B) of face B
+    // where B's base vertex v_B === u_A.
+    const vStart = new Map(horizon.map(({v},i) => [v, newFids[i]]));
+    for (let i=0; i<horizon.length; i++) {
+      const fk=vStart.get(horizon[i].u);
+      if (fk!==undefined) link(newFids[i],1, fk,2);
     }
 
-    if (cell.length < 3) continue;
-    const clipped = _clipEA(cell, MAX_Y_S, MAX_Y_N);
-    if (clipped.length < 3) continue;
-    cells[key] = _subdividePoly(clipped.map(([x, y]) => EA_INV(x, y)));
-  }
-  return cells;
-})();
+    // Update conflict lists for new faces.
+    // Key property (de Berg §11.2): any point visible from new face (v,u,pt) must
+    // have been visible from either fAdj or from the visible face that owned edge (u→v).
+    // → candidate set = union of those two conflict lists, filtered by visibility.
+    for (let i=0; i<horizon.length; i++) {
+      const {u, v, fAdj}=horizon[i], fi=newFids[i];
+      let fVisPts=new Set();
+      for (const fv of visFids) { if (edgeOf(fv,u,v)>=0) { fVisPts=F(fv).pts; break; } }
+      const cands = fAdj>=0 ? new Set([...fVisPts, ...F(fAdj).pts]) : fVisPts;
+      for (const q of cands) {
+        if (q!==pt && pConfl.has(q) && visible(fi,q)) {
+          F(fi).pts.add(q); pConfl.get(q).add(fi);
+        }
+      }
+    }
 
-// Match a game region to its seed entry in _SEEDS.
-function findGeo(id, name) {
+    // Remove visible faces; scrub them from every surviving point's conflict list.
+    for (const fv of visFids) {
+      for (const q of F(fv).pts) { if (q!==pt && pConfl.has(q)) pConfl.get(q).delete(fv); }
+      F(fv).alive=false;
+    }
+    pConfl.delete(pt);
+  }
+
+  return hull.filter(f=>f.alive).map(f=>f.v.slice());
+}
+
+// ── Spherical Delaunay triangulation ─────────────────────────────────────────
+//
+// Wraps _convexHull3D: extracts Voronoi vertices and the adjacency graph.
+//
+// Voronoi vertex of Delaunay triangle (i,j,k) = outward unit normal of the
+// convex hull face = normalize((b-a)×(c-a)).
+// Proof of equidistance: N=(b-a)×(c-a) is perpendicular to both (b-a) and
+// (c-a), so N·a = N·b = N·c, i.e. normalize(N) has equal dot-product with
+// a, b, c — equal geodesic distance on the unit sphere.
+//
+// seedList  : array of region objects with .id
+// seedXYZ   : parallel array of [x,y,z] unit vectors
+function _delaunay(seedList, seedXYZ) {
+  const n        = seedList.length;
+  const cellVerts = Array.from({ length: n }, () => []);
+  const adjSets   = Array.from({ length: n }, () => new Set());
+
+  for (const [i,j,k] of _convexHull3D(seedXYZ)) {
+    const a=seedXYZ[i], b=seedXYZ[j], c=seedXYZ[k];
+    // Outward unit normal = Voronoi vertex shared by cells i, j, k
+    const nx=(b[1]-a[1])*(c[2]-a[2])-(b[2]-a[2])*(c[1]-a[1]);
+    const ny=(b[2]-a[2])*(c[0]-a[0])-(b[0]-a[0])*(c[2]-a[2]);
+    const nz=(b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);
+    const len=Math.sqrt(nx*nx+ny*ny+nz*nz);
+    if (len<1e-10) continue;
+    const v=[nx/len, ny/len, nz/len];
+    cellVerts[i].push(v); cellVerts[j].push(v); cellVerts[k].push(v);
+    adjSets[i].add(j); adjSets[i].add(k);
+    adjSets[j].add(i); adjSets[j].add(k);
+    adjSets[k].add(i); adjSets[k].add(j);
+  }
+
+  const adjacency = new Map();
+  for (let si=0; si<n; si++) {
+    adjacency.set(seedList[si].id, [...adjSets[si]].map(ti => seedList[ti].id));
+  }
+  return { cellVerts, adjacency };
+}
+
+// ── Voronoi cells from Delaunay output ───────────────────────────────────────
+//
+// Each cell is the angular-sorted convex hull of the Delaunay vertices belonging
+// to that seed, projected back to lon/lat and edge-subdivided along great circles.
+//
+// Called once on first render() with world.regions as input.
+function _buildGeo(regions) {
+  const seeds   = new Map(regions.map(r => [_toKey(r.id), r]));
+  const geoKeys = [...seeds.keys()].filter(k => !k.startsWith('sea_'));
+
+  const seedList = [...seeds.values()];
+  const seedXYZ  = seedList.map(r => _toXYZ(r.lon, r.lat));
+
+  const { cellVerts, adjacency } = _delaunay(seedList, seedXYZ);
+
+  const geoCells = {};
+  for (let si = 0; si < seedList.length; si++) {
+    const key   = _toKey(seedList[si].id);
+    const verts = cellVerts[si];
+    if (verts.length < 3) continue;
+
+    const s = seedXYZ[si];
+    let ux, uy, uz;
+    if (Math.abs(s[2]) < 0.99) { ux = -s[1]; uy = s[0]; uz = 0; }
+    else                        { ux = 1;      uy = 0;    uz = 0; }
+    const uLen = Math.sqrt(ux*ux + uy*uy + uz*uz);
+    ux /= uLen; uy /= uLen; uz /= uLen;
+    const wx = s[1]*uz - s[2]*uy;
+    const wy = s[2]*ux - s[0]*uz;
+    const wz = s[0]*uy - s[1]*ux;
+
+    verts.sort((p, q) => {
+      const ap = Math.atan2(p[0]*wx+p[1]*wy+p[2]*wz, p[0]*ux+p[1]*uy+p[2]*uz);
+      const aq = Math.atan2(q[0]*wx+q[1]*wy+q[2]*wz, q[0]*ux+q[1]*uy+q[2]*uz);
+      return ap - aq;
+    });
+
+    geoCells[key] = _subdividePoly(verts.map(([vx, vy, vz]) => _fromXYZ(vx, vy, vz)));
+  }
+
+  return { seeds, geoKeys, geoCells, adjacency };
+}
+
+// Match a game region to its seed entry in the seeds map.
+function findGeo(id, name, seeds, geoKeys) {
   const norm = s => (s ?? '').toLowerCase()
     .replace(/^reg_/, '').replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
   const nid   = norm(id);
   const nname = norm(name);
 
-  if (_SEEDS.has(nid))   return _SEEDS.get(nid);
-  if (_SEEDS.has(nname)) return _SEEDS.get(nname);
+  if (seeds.has(nid))   return seeds.get(nid);
+  if (seeds.has(nname)) return seeds.get(nname);
 
-  for (const key of _GEO_KEYS) {
+  for (const key of geoKeys) {
     if (key.length >= 5 && nid.length >= 5 && (nid === key || nid.includes(key) || key.includes(nid)))
-      return _SEEDS.get(key);
+      return seeds.get(key);
   }
 
   const ALIAS = {
@@ -189,7 +330,7 @@ function findGeo(id, name) {
   };
   for (const [alias, geoKey] of Object.entries(ALIAS)) {
     if (nname.includes(alias) || nid.includes(alias)) {
-      const seed = _SEEDS.get(geoKey);
+      const seed = seeds.get(geoKey);
       if (seed) return seed;
     }
   }
@@ -339,7 +480,11 @@ export class MapView {
     this.ctx      = canvas.getContext('2d');
     this.onSelect = onSelect;
 
-    this._world    = null;
+    this._world      = null;
+    this._seeds      = null;   // Map<key, region> — built from world.regions on first render
+    this._geoKeys    = null;   // string[] — renderable (non-sea) keys
+    this._geoCells   = null;   // { [key]: [[lon,lat],...] } — Voronoi cells
+    this._adjacency  = null;   // Map<regionId, regionId[]> — from Delaunay triangulation
     this._entries  = [];   // { region, key, cLon, cLat }
     this._allGeo   = [];   // { key, poly, cLon, cLat }
     this._selected = null;
@@ -379,7 +524,19 @@ export class MapView {
   render(world) {
     this._world    = world;
     this._selected = null;
+    if (!this._seeds) {
+      const { seeds, geoKeys, geoCells, adjacency } = _buildGeo(world.regions ?? []);
+      this._seeds      = seeds;
+      this._geoKeys    = geoKeys;
+      this._geoCells   = geoCells;
+      this._adjacency  = adjacency;
+    }
     this._layout();
+  }
+
+  /** Returns the full region IDs adjacent to regionId, computed from Delaunay triangulation. */
+  getAdjacentIds(regionId) {
+    return this._adjacency?.get(regionId) ?? [];
   }
 
   deselect() {
@@ -425,13 +582,13 @@ export class MapView {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     // Use pre-computed Voronoi cells — projected per-frame in _draw()
-    this._allGeo = _GEO_KEYS
-      .filter(key => _GEO_CELLS[key])
+    this._allGeo = (this._geoKeys ?? [])
+      .filter(key => this._geoCells[key])
       .map(key => {
-        const seed = _SEEDS.get(key);
+        const seed = this._seeds.get(key);
         return {
           key,
-          poly: _GEO_CELLS[key],   // [[lon, lat], ...] Voronoi cell
+          poly: this._geoCells[key],   // [[lon, lat], ...] Voronoi cell
           cLon: seed.lon,
           cLat: seed.lat,
         };
@@ -439,7 +596,7 @@ export class MapView {
 
     this._entries = (this._world?.regions ?? []).map(r => {
       const key  = r.id.replace(/^reg_/, '');
-      const seed = _SEEDS.get(key) ?? findGeo(r.id, r.name);
+      const seed = this._seeds.get(key) ?? findGeo(r.id, r.name, this._seeds, this._geoKeys);
       if (!seed) return null;
       const cLon = r.lon  != null ? r.lon  : seed.lon;
       const cLat = r.lat  != null ? r.lat  : seed.lat;

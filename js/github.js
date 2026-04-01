@@ -48,10 +48,9 @@ export class GitHubClient {
 
   // ── World state loading ─────────────────────────────────────────────
 
-  /** Fetch static region topology from conspiracy-game/world/map.json. */
+  /** Fetch static region topology from cnspr/engine/world/map.json. */
   async loadMap() {
-    const url = new URL('../world/map.json', import.meta.url);
-    const res = await fetch(url);
+    const res = await fetch('https://raw.githubusercontent.com/cnspr/engine/main/world/map_cube.json');
     if (!res.ok) return [];
     return res.json();
   }
@@ -112,7 +111,7 @@ export class GitHubClient {
   // ── Onboarding helpers ─────────────────────────────────────────────
 
   /**
-   * Fork the canonical conspiracy repo into the authenticated user's account.
+   * Fork the canonical world repo into the authenticated user's account.
    * Returns the fork object. GitHub creates forks asynchronously — callers
    * should poll isForkReady() after this returns.
    */
@@ -123,7 +122,7 @@ export class GitHubClient {
   /** Returns true once the player's fork exists and is accessible. */
   async isForkReady(userid) {
     try {
-      await this._get(`/repos/${userid}/conspiracy`);
+      await this._get(`/repos/${userid}/world`);
       return true;
     } catch {
       return false;
@@ -139,17 +138,17 @@ export class GitHubClient {
     const path   = `${userid}/turn.json`;
 
     // Get HEAD of main on the fork
-    const ref = await this._get(`/repos/${userid}/conspiracy/git/ref/heads/main`);
+    const ref = await this._get(`/repos/${userid}/world/git/ref/heads/main`);
     const sha  = ref.object.sha;
 
     // Create the join branch
-    await this._post(`/repos/${userid}/conspiracy/git/refs`, {
+    await this._post(`/repos/${userid}/world/git/refs`, {
       ref: `refs/heads/${branch}`,
       sha,
     });
 
     // Commit the initial world file
-    await this._put(`/repos/${userid}/conspiracy/contents/${path}`, {
+    await this._put(`/repos/${userid}/world/contents/${path}`, {
       message: `Initialize world for ${userid}`,
       content: btoa(JSON.stringify({ turn: 0 }, null, 2)),
       branch,

@@ -34,7 +34,7 @@ export class RegionInfoPanel {
     this.onDismiss = onDismiss ?? null;
   }
 
-  show(region, world) {
+  show(region, world, adjacentIds = []) {
     const factionMap = {};
     for (const f of (world?.factions ?? [])) factionMap[f.id] = f;
 
@@ -81,7 +81,13 @@ export class RegionInfoPanel {
          <div class="wi-modifier">${region.unique_modifier}</div>`
       : '';
 
-    const adjacent = (region.adjacent_region_ids ?? []).join(', ') || '—';
+    const regionById = new Map((world?.regions ?? []).map(r => [r.id, r]));
+    const adjacent = adjacentIds.length
+      ? adjacentIds
+          .filter(id => !id.startsWith('sea_'))
+          .map(id => regionById.get(id)?.name ?? id.replace(/^reg_/, '').replace(/_/g, ' '))
+          .join(', ')
+      : '—';
 
     // Influence breakdown HTML
     const influenceHtml = sorted.length
