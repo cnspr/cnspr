@@ -82,7 +82,7 @@ function showLogin(errorMsg) {
         headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
       }).then(r => r.ok ? r.json() : Promise.reject(new Error('Invalid token')));
 
-      cfg = { userid: me.login, github_token: token, github_repo: `${me.login}/conspiracy`, ...(mubertKey ? { mubert_api_key: mubertKey } : {}) };
+      cfg = { userid: me.login, github_token: token, github_repo: `${me.login}/world`, ...(mubertKey ? { mubert_api_key: mubertKey } : {}) };
       Config.save(cfg);
       dbg.info('PAT login successful', { userid: cfg.userid });
       initApp();
