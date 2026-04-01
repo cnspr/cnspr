@@ -37,18 +37,9 @@ function unrestColor(u) {
 }
 
 // ── Region seeds, keys, and cell polygons ─────────────────────────────────────
-// All region seeds (lon, lat) and the adjacency graph come from map.json.
-// No hardcoded coordinate table exists here.
-
-// Load all region seeds and adjacency graph from map.json.
 // Keys: reg_* → strip "reg_" prefix; sea_* → kept as-is.
-// Sea regions are included as bisector seeds but excluded from rendering.
-const _MAP_DATA = await fetch('./world/map.json').then(r => r.json());
-const _toKey    = id => id.replace(/^reg_/, '');
-const _SEEDS    = new Map(_MAP_DATA.map(r => [_toKey(r.id), r]));
-
-// Keys of renderable (non-sea) regions — derived from map.json, not a hardcoded table.
-const _GEO_KEYS = [..._SEEDS.keys()].filter(k => !k.startsWith('sea_'));
+// Geometry is built lazily from world.regions on first render() — no fetch needed.
+const _toKey = id => id.replace(/^reg_/, '');
 
 // ── Voronoi cells (adjacency-graph half-plane intersection) ──────────────────
 //
@@ -56,7 +47,12 @@ const _GEO_KEYS = [..._SEEDS.keys()].filter(k => !k.startsWith('sea_'));
 // between p and each adjacent seed. The resulting polygon is the set of EA points
 // closer to p than to any declared neighbour. Together the non-sea cells tile the
 // visible globe with no gaps.
-const _GEO_CELLS = (() => {
+//
+// Called once on first render() with world.regions as input.
+function _buildGeo(regions) {
+  const seeds   = new Map(regions.map(r => [_toKey(r.id), r]));
+  const geoKeys = [...seeds.keys()].filter(k => !k.startsWith('sea_'));
+  const geoCells = (() => {
   const EA_FWD = (lon, lat) => [lon, Math.sin(lat * Math.PI / 180)];
   const EA_INV = (x, y)    => [x,   Math.asin(Math.max(-1, Math.min(1, y))) * 180 / Math.PI];
 
@@ -137,17 +133,16 @@ const _GEO_CELLS = (() => {
   const MAX_Y_S = Math.sin(-60 * Math.PI / 180);  // sin(−60°) ≈ −0.866
 
   const cells = {};
-  for (const [key, region] of _SEEDS) {
+  for (const [key, region] of seeds) {
     if (key === 'arctic')     { cells[key] = _capPoly(75, 90);   continue; }
     if (key === 'antarctica') { cells[key] = _capPoly(-60, -90); continue; }
 
     let cell = [[-180, -1], [180, -1], [180, 1], [-180, 1]];
     const [ax, ay] = EA_FWD(region.lon, region.lat);
 
-    for (const adjId of (region.adjacent_region_ids ?? [])) {
-      const adj = _SEEDS.get(_toKey(adjId));
-      if (!adj) continue;
-      const [bx, by] = EA_FWD(adj.lon, adj.lat);
+    for (const [otherKey, other] of seeds) {
+      if (otherKey === key) continue;
+      const [bx, by] = EA_FWD(other.lon, other.lat);
       cell = _clipHalfPlane(cell, ax, ay, bx, by);
       if (cell.length < 3) break;
     }
@@ -158,21 +153,23 @@ const _GEO_CELLS = (() => {
     cells[key] = _subdividePoly(clipped.map(([x, y]) => EA_INV(x, y)));
   }
   return cells;
-})();
+  })();
+  return { seeds, geoKeys, geoCells };
+}
 
-// Match a game region to its seed entry in _SEEDS.
-function findGeo(id, name) {
+// Match a game region to its seed entry in the seeds map.
+function findGeo(id, name, seeds, geoKeys) {
   const norm = s => (s ?? '').toLowerCase()
     .replace(/^reg_/, '').replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
   const nid   = norm(id);
   const nname = norm(name);
 
-  if (_SEEDS.has(nid))   return _SEEDS.get(nid);
-  if (_SEEDS.has(nname)) return _SEEDS.get(nname);
+  if (seeds.has(nid))   return seeds.get(nid);
+  if (seeds.has(nname)) return seeds.get(nname);
 
-  for (const key of _GEO_KEYS) {
+  for (const key of geoKeys) {
     if (key.length >= 5 && nid.length >= 5 && (nid === key || nid.includes(key) || key.includes(nid)))
-      return _SEEDS.get(key);
+      return seeds.get(key);
   }
 
   const ALIAS = {
@@ -189,7 +186,7 @@ function findGeo(id, name) {
   };
   for (const [alias, geoKey] of Object.entries(ALIAS)) {
     if (nname.includes(alias) || nid.includes(alias)) {
-      const seed = _SEEDS.get(geoKey);
+      const seed = seeds.get(geoKey);
       if (seed) return seed;
     }
   }
@@ -340,6 +337,9 @@ export class MapView {
     this.onSelect = onSelect;
 
     this._world    = null;
+    this._seeds    = null;   // Map<key, region> — built from world.regions on first render
+    this._geoKeys  = null;   // string[] — renderable (non-sea) keys
+    this._geoCells = null;   // { [key]: [[lon,lat],...] } — Voronoi cells
     this._entries  = [];   // { region, key, cLon, cLat }
     this._allGeo   = [];   // { key, poly, cLon, cLat }
     this._selected = null;
@@ -379,6 +379,12 @@ export class MapView {
   render(world) {
     this._world    = world;
     this._selected = null;
+    if (!this._seeds) {
+      const { seeds, geoKeys, geoCells } = _buildGeo(world.regions ?? []);
+      this._seeds    = seeds;
+      this._geoKeys  = geoKeys;
+      this._geoCells = geoCells;
+    }
     this._layout();
   }
 
@@ -425,13 +431,13 @@ export class MapView {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     // Use pre-computed Voronoi cells — projected per-frame in _draw()
-    this._allGeo = _GEO_KEYS
-      .filter(key => _GEO_CELLS[key])
+    this._allGeo = (this._geoKeys ?? [])
+      .filter(key => this._geoCells[key])
       .map(key => {
-        const seed = _SEEDS.get(key);
+        const seed = this._seeds.get(key);
         return {
           key,
-          poly: _GEO_CELLS[key],   // [[lon, lat], ...] Voronoi cell
+          poly: this._geoCells[key],   // [[lon, lat], ...] Voronoi cell
           cLon: seed.lon,
           cLat: seed.lat,
         };
@@ -439,7 +445,7 @@ export class MapView {
 
     this._entries = (this._world?.regions ?? []).map(r => {
       const key  = r.id.replace(/^reg_/, '');
-      const seed = _SEEDS.get(key) ?? findGeo(r.id, r.name);
+      const seed = this._seeds.get(key) ?? findGeo(r.id, r.name, this._seeds, this._geoKeys);
       if (!seed) return null;
       const cLon = r.lon  != null ? r.lon  : seed.lon;
       const cLat = r.lat  != null ? r.lat  : seed.lat;

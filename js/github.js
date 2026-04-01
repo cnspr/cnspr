@@ -50,7 +50,7 @@ export class GitHubClient {
 
   /** Fetch static region topology from cnspr/engine/world/map.json. */
   async loadMap() {
-    const res = await fetch('https://raw.githubusercontent.com/cnspr/engine/main/world/map.json');
+    const res = await fetch('https://raw.githubusercontent.com/cnspr/engine/main/world/map_test.json');
     if (!res.ok) return [];
     return res.json();
   }

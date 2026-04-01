@@ -3,7 +3,7 @@
  * Wires together config, GitHub client, and all UI panels.
  */
 
-alert(1)
+debugger;
 import { Config }       from './config.js';
 import { GitHubClient, AuthError } from './github.js';
 import { MusicPlayer, MOODS }  from './musicplayer.js';
@@ -104,6 +104,7 @@ function handleAuthError() {
 
 // ── Main app ────────────────────────────────────────────────────────────────
 function initApp() {
+  alert(1)
   document.getElementById('login-screen').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
 
