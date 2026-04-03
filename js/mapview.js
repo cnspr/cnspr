@@ -149,6 +149,24 @@ function _buildGeo(regions) {
     }
 
     if (cell.length < 3) continue;
+
+    // If the Voronoi cell reaches a pole the polar edge collapses to a single
+    // point in lon/lat space, producing a degenerate fan.  Detect this and use
+    // _capPoly (same treatment as hard-coded arctic/antarctica) with a boundary
+    // latitude derived from the actual Voronoi result.
+    const atNorth = cell.some(([, y]) => y >=  1 - 1e-9);
+    const atSouth = cell.some(([, y]) => y <= -1 + 1e-9);
+    if (atNorth) {
+      const capY   = Math.min(...cell.filter(([, y]) => y < 1 - 1e-9).map(([, y]) => y));
+      cells[key]   = _capPoly(EA_INV(0, capY)[1], 90);
+      continue;
+    }
+    if (atSouth) {
+      const capY   = Math.max(...cell.filter(([, y]) => y > -1 + 1e-9).map(([, y]) => y));
+      cells[key]   = _capPoly(EA_INV(0, capY)[1], -90);
+      continue;
+    }
+
     const clipped = _clipEA(cell, MAX_Y_S, MAX_Y_N);
     if (clipped.length < 3) continue;
     cells[key] = _subdividePoly(clipped.map(([x, y]) => EA_INV(x, y)));
