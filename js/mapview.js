@@ -128,9 +128,10 @@ function _buildGeo(regions) {
     return out;
   }
 
-  // Non-polar cells are capped at these EA y values so no cell touches y=±1.
-  const MAX_Y_N = Math.sin(75 * Math.PI / 180);   //  sin(75°) ≈ 0.966
-  const MAX_Y_S = Math.sin(-60 * Math.PI / 180);  // sin(−60°) ≈ −0.866
+  // Non-polar cells are capped so they don't overlap the arctic/antarctica cap polygons.
+  // If those special seeds are absent (e.g. test maps), allow cells to reach the poles.
+  const MAX_Y_N = seeds.has('arctic')     ? Math.sin(75  * Math.PI / 180) :  1.0;
+  const MAX_Y_S = seeds.has('antarctica') ? Math.sin(-60 * Math.PI / 180) : -1.0;
 
   const cells = {};
   for (const [key, region] of seeds) {
