@@ -12,23 +12,25 @@
  */
 // (No external imports — Voronoi cells are built from the adjacency graph in map.json)
 
-// ── Colours ──────────────────────────────────────────────────────────────────
+// ── Colours (read from CSS custom properties defined in style.css) ───────────
+
+const _css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 
 const FACTION_COLORS = {
-  federation: '#4a9eff',
-  syndicate:  '#e6a820',
-  conspiracy: '#9b59b6',
+  federation: _css('--accent2'),
+  syndicate:  _css('--faction-syndicate'),
+  conspiracy: _css('--faction-conspiracy'),
 };
-const COL_OCEAN      = '#0a1020';
-const COL_LAND_DEF   = '#1a2030';
-const COL_BORDER     = '#2a3548';
-const COL_BORDER_HOV = '#4a6088';
-const COL_BORDER_SEL = '#8090c8';
-const COL_TEXT       = '#d4d4e8';
-const COL_MUTED      = '#6878a0';
-const COL_UNREST_LO  = '#27ae60';
-const COL_UNREST_MD  = '#e67e22';
-const COL_UNREST_HI  = '#c0392b';
+const COL_OCEAN      = _css('--map-ocean');
+const COL_LAND_DEF   = _css('--map-land');
+const COL_BORDER     = _css('--map-border');
+const COL_BORDER_HOV = _css('--map-border-hov');
+const COL_BORDER_SEL = _css('--map-border-sel');
+const COL_TEXT       = _css('--text');
+const COL_MUTED      = _css('--muted');
+const COL_UNREST_LO  = _css('--good');
+const COL_UNREST_MD  = _css('--warn');
+const COL_UNREST_HI  = _css('--danger');
 
 function unrestColor(u) {
   if (u > 60) return COL_UNREST_HI;
@@ -41,124 +43,107 @@ function unrestColor(u) {
 // Geometry is built lazily from world.regions on first render() — no fetch needed.
 const _toKey = id => id.replace(/^reg_/, '');
 
-// ── Voronoi cells (adjacency-graph half-plane intersection) ──────────────────
+// ── Spherical Voronoi cells ───────────────────────────────────────────────────
 //
-// For each region seed p, clip the EA bounding box by the perpendicular bisector
-// between p and each adjacent seed. The resulting polygon is the set of EA points
-// closer to p than to any declared neighbour. Together the non-sea cells tile the
-// visible globe with no gaps.
+// For each seed, find all Voronoi vertices: points equidistant from 3 seeds and
+// closer to those 3 than to any other.  Each vertex is the intersection of two
+// great-circle bisector planes, computed exactly in 3-D as a cross-product.
+// Vertices are sorted by angle around the seed axis to form the cell polygon.
+//
+// No EA projection, no bounding-box approximation — correct for all latitudes.
 //
 // Called once on first render() with world.regions as input.
 function _buildGeo(regions) {
   const seeds   = new Map(regions.map(r => [_toKey(r.id), r]));
   const geoKeys = [...seeds.keys()].filter(k => !k.startsWith('sea_'));
+
   const geoCells = (() => {
-  const EA_FWD = (lon, lat) => [lon, Math.sin(lat * Math.PI / 180)];
-  const EA_INV = (x, y)    => [x,   Math.asin(Math.max(-1, Math.min(1, y))) * 180 / Math.PI];
+    // Build a spherical cap polygon in lon/lat by densely sampling the boundary
+    // latitude circle (every 2° lon) then closing through the pole.
+    function _capPoly(capLat, poleLat) {
+      const pts = [];
+      for (let lon = -180; lon <= 180; lon += 2) pts.push([lon, capLat]);
+      pts.push([180, poleLat]);
+      pts.push([-180, poleLat]);
+      pts.push([-180, capLat]);
+      return _subdividePoly(pts);
+    }
 
-  // Sutherland-Hodgman clip of an EA polygon to yMin ≤ y ≤ yMax.
-  function _clipEA(poly, yMin, yMax) {
-    let pts = poly;
-    // clip north: keep y ≤ yMax
-    {
-      const out = [];
-      for (let i = 0; i < pts.length; i++) {
-        const a = pts[i], b = pts[(i + 1) % pts.length];
-        if (a[1] <= yMax) out.push(a);
-        if ((a[1] <= yMax) !== (b[1] <= yMax)) {
-          const t = (yMax - a[1]) / (b[1] - a[1]);
-          out.push([a[0] + t * (b[0] - a[0]), yMax]);
+    const seedList = [...seeds.values()];
+    const seedXYZ  = seedList.map(r => _toXYZ(r.lon, r.lat));
+    const n        = seedList.length;
+    const cells    = {};
+
+    for (let si = 0; si < n; si++) {
+      const key = _toKey(seedList[si].id);
+
+      if (key === 'arctic')     { cells[key] = _capPoly(75, 90);   continue; }
+      if (key === 'antarctica') { cells[key] = _capPoly(-60, -90); continue; }
+
+      const s = seedXYZ[si];
+      const verts = [];  // Voronoi vertices for this cell (3-D unit vectors)
+
+      // For each pair of other seeds (a, b), the intersection of their bisector
+      // planes with the bisector of (s, a) is a great circle. Its two poles are
+      // candidates for a Voronoi vertex shared by s, a, and b.
+      for (let ai = 0; ai < n; ai++) {
+        if (ai === si) continue;
+        for (let bi = ai + 1; bi < n; bi++) {
+          if (bi === si) continue;
+          const a = seedXYZ[ai], b = seedXYZ[bi];
+
+          // Bisector normals:  n1 = s − a,  n2 = s − b
+          // Candidate vertex ∝ n1 × n2
+          const n1x = s[0]-a[0], n1y = s[1]-a[1], n1z = s[2]-a[2];
+          const n2x = s[0]-b[0], n2y = s[1]-b[1], n2z = s[2]-b[2];
+          const cx = n1y*n2z - n1z*n2y;
+          const cy = n1z*n2x - n1x*n2z;
+          const cz = n1x*n2y - n1y*n2x;
+          const cLen = Math.sqrt(cx*cx + cy*cy + cz*cz);
+          if (cLen < 1e-10) continue;  // degenerate (collinear seeds)
+
+          for (const sign of [1, -1]) {
+            const vx = sign * cx / cLen;
+            const vy = sign * cy / cLen;
+            const vz = sign * cz / cLen;
+
+            // Accept only if v is s's nearest seed (no seed closer than s)
+            const vs = vx*s[0] + vy*s[1] + vz*s[2];
+            let ok = true;
+            for (let ti = 0; ti < n; ti++) {
+              if (ti === si) continue;
+              const t = seedXYZ[ti];
+              if (vx*t[0] + vy*t[1] + vz*t[2] > vs + 1e-10) { ok = false; break; }
+            }
+            if (ok) verts.push([vx, vy, vz]);
+          }
         }
       }
-      pts = out;
-    }
-    // clip south: keep y ≥ yMin
-    {
-      const out = [];
-      for (let i = 0; i < pts.length; i++) {
-        const a = pts[i], b = pts[(i + 1) % pts.length];
-        if (a[1] >= yMin) out.push(a);
-        if ((a[1] >= yMin) !== (b[1] >= yMin)) {
-          const t = (yMin - a[1]) / (b[1] - a[1]);
-          out.push([a[0] + t * (b[0] - a[0]), yMin]);
-        }
-      }
-      pts = out;
-    }
-    return pts;
-  }
 
-  // Build a spherical cap polygon in lon/lat by densely sampling the boundary
-  // latitude circle (every 2° lon) then closing through the pole.
-  function _capPoly(capLat, poleLat) {
-    const pts = [];
-    for (let lon = -180; lon <= 180; lon += 2) pts.push([lon, capLat]);
-    pts.push([180, poleLat]);
-    pts.push([-180, poleLat]);
-    pts.push([-180, capLat]);
-    return _subdividePoly(pts);
-  }
+      if (verts.length < 3) continue;
 
-  // Clip poly to the half-plane closer to (ax, ay) than to (bx, by) in EA space.
-  // Adjusts bx to take the shorter path across the antimeridian when needed.
-  // If the adjusted path still spans >180°, the bisector falls outside the bounding
-  // box and the clip is skipped (poly returned unchanged).
-  function _clipHalfPlane(poly, ax, ay, bx, by) {
-    if (bx - ax > 180) bx -= 360;
-    else if (bx - ax < -180) bx += 360;
-    if (Math.abs(bx - ax) > 180) return poly;
-    const mx = (ax + bx) / 2, my = (ay + by) / 2;
-    const nx = bx - ax, ny = by - ay;
-    const inside = (px, py) => (px - mx) * nx + (py - my) * ny <= 0;
-    const out = [];
-    for (let i = 0; i < poly.length; i++) {
-      const a = poly[i], b = poly[(i + 1) % poly.length];
-      const aIn = inside(a[0], a[1]);
-      const bIn = inside(b[0], b[1]);
-      if (aIn) out.push(a);
-      if (aIn !== bIn) {
-        const denom = (b[0] - a[0]) * nx + (b[1] - a[1]) * ny;
-        if (Math.abs(denom) > 1e-10) {
-          const t = ((mx - a[0]) * nx + (my - a[1]) * ny) / denom;
-          if (t > 0 && t < 1)
-            out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
-        }
-      }
-    }
-    return out;
-  }
+      // Sort vertices by angle around the seed axis using a local tangent frame
+      let ux, uy, uz;
+      if (Math.abs(s[2]) < 0.99) { ux = -s[1]; uy = s[0]; uz = 0; }
+      else                        { ux = 1;      uy = 0;    uz = 0; }
+      const uLen = Math.sqrt(ux*ux + uy*uy + uz*uz);
+      ux /= uLen; uy /= uLen; uz /= uLen;
+      const wx = s[1]*uz - s[2]*uy;
+      const wy = s[2]*ux - s[0]*uz;
+      const wz = s[0]*uy - s[1]*ux;
 
-  // Non-polar cells are capped so they don't overlap the arctic/antarctica cap polygons.
-  // If those special seeds are absent (e.g. test maps), allow cells to reach the poles.
-  const MAX_Y_N = seeds.has('arctic')     ? Math.sin(75  * Math.PI / 180) :  1.0;
-  const MAX_Y_S = seeds.has('antarctica') ? Math.sin(-60 * Math.PI / 180) : -1.0;
+      verts.sort((p, q) => {
+        const ap = Math.atan2(p[0]*wx+p[1]*wy+p[2]*wz, p[0]*ux+p[1]*uy+p[2]*uz);
+        const aq = Math.atan2(q[0]*wx+q[1]*wy+q[2]*wz, q[0]*ux+q[1]*uy+q[2]*uz);
+        return ap - aq;
+      });
 
-  const cells = {};
-  for (const [key, region] of seeds) {
-    if (key === 'arctic')     { cells[key] = _capPoly(75, 90);   continue; }
-    if (key === 'antarctica') { cells[key] = _capPoly(-60, -90); continue; }
-
-    // Bounding box stops just short of y=±1 so polar cells never produce
-    // degenerate edges (all points at y=1 map to the same lon/lat pole point).
-    const Y_MAX = 1 - 1e-6;
-    let cell = [[-180, -Y_MAX], [180, -Y_MAX], [180, Y_MAX], [-180, Y_MAX]];
-    const [ax, ay] = EA_FWD(region.lon, region.lat);
-
-    for (const [otherKey, other] of seeds) {
-      if (otherKey === key) continue;
-      const [bx, by] = EA_FWD(other.lon, other.lat);
-      cell = _clipHalfPlane(cell, ax, ay, bx, by);
-      if (cell.length < 3) break;
+      cells[key] = _subdividePoly(verts.map(([vx, vy, vz]) => _fromXYZ(vx, vy, vz)));
     }
 
-    if (cell.length < 3) continue;
-
-    const clipped = _clipEA(cell, MAX_Y_S, MAX_Y_N);
-    if (clipped.length < 3) continue;
-    cells[key] = _subdividePoly(clipped.map(([x, y]) => EA_INV(x, y)));
-  }
-  return cells;
+    return cells;
   })();
+
   return { seeds, geoKeys, geoCells };
 }
 
