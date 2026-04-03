@@ -45,84 +45,74 @@ const _toKey = id => id.replace(/^reg_/, '');
 
 // ── Spherical Voronoi cells ───────────────────────────────────────────────────
 //
-// For each seed, find all Voronoi vertices: points equidistant from 3 seeds and
-// closer to those 3 than to any other.  Each vertex is the intersection of two
-// great-circle bisector planes, computed exactly in 3-D as a cross-product.
-// Vertices are sorted by angle around the seed axis to form the cell polygon.
+// Each Voronoi vertex is shared by exactly 3 cells — computed ONCE per triple of
+// seeds and distributed to all three cells so that adjacent cell borders share
+// identical vertex coordinates (no floating-point drift at boundaries).
 //
-// No EA projection, no bounding-box approximation — correct for all latitudes.
-//
-// Called once on first render() with world.regions as input.
+// Vertex = intersection of two great-circle bisector planes in 3-D (cross-product
+// of normals).  Called once on first render() with world.regions as input.
 function _buildGeo(regions) {
   const seeds   = new Map(regions.map(r => [_toKey(r.id), r]));
   const geoKeys = [...seeds.keys()].filter(k => !k.startsWith('sea_'));
 
   const geoCells = (() => {
-    // Build a spherical cap polygon in lon/lat by densely sampling the boundary
-    // latitude circle (every 2° lon) then closing through the pole.
-    function _capPoly(capLat, poleLat) {
-      const pts = [];
-      for (let lon = -180; lon <= 180; lon += 2) pts.push([lon, capLat]);
-      pts.push([180, poleLat]);
-      pts.push([-180, poleLat]);
-      pts.push([-180, capLat]);
-      return _subdividePoly(pts);
-    }
-
     const seedList = [...seeds.values()];
     const seedXYZ  = seedList.map(r => _toXYZ(r.lon, r.lat));
     const n        = seedList.length;
-    const cells    = {};
 
-    for (let si = 0; si < n; si++) {
-      const key = _toKey(seedList[si].id);
+    // cellVerts[i] accumulates shared 3-D unit-vector vertices for seed i
+    const cellVerts = Array.from({ length: n }, () => []);
 
-      if (key === 'arctic')     { cells[key] = _capPoly(75, 90);   continue; }
-      if (key === 'antarctica') { cells[key] = _capPoly(-60, -90); continue; }
+    // Enumerate every triple of seeds once.  For each triple (i,j,k) find the
+    // point(s) on the sphere equidistant from all three and closer to them than
+    // to any other seed — that is a valid Voronoi vertex shared by i, j, and k.
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        for (let k = j + 1; k < n; k++) {
+          const a = seedXYZ[i], b = seedXYZ[j], c = seedXYZ[k];
 
-      const s = seedXYZ[si];
-      const verts = [];  // Voronoi vertices for this cell (3-D unit vectors)
-
-      // For each pair of other seeds (a, b), the intersection of their bisector
-      // planes with the bisector of (s, a) is a great circle. Its two poles are
-      // candidates for a Voronoi vertex shared by s, a, and b.
-      for (let ai = 0; ai < n; ai++) {
-        if (ai === si) continue;
-        for (let bi = ai + 1; bi < n; bi++) {
-          if (bi === si) continue;
-          const a = seedXYZ[ai], b = seedXYZ[bi];
-
-          // Bisector normals:  n1 = s − a,  n2 = s − b
-          // Candidate vertex ∝ n1 × n2
-          const n1x = s[0]-a[0], n1y = s[1]-a[1], n1z = s[2]-a[2];
-          const n2x = s[0]-b[0], n2y = s[1]-b[1], n2z = s[2]-b[2];
+          // Bisector plane of (i,j) has normal (a−b); of (j,k) has normal (b−c).
+          // Their intersection direction = (a−b) × (b−c).
+          const n1x = a[0]-b[0], n1y = a[1]-b[1], n1z = a[2]-b[2];
+          const n2x = b[0]-c[0], n2y = b[1]-c[1], n2z = b[2]-c[2];
           const cx = n1y*n2z - n1z*n2y;
           const cy = n1z*n2x - n1x*n2z;
           const cz = n1x*n2y - n1y*n2x;
           const cLen = Math.sqrt(cx*cx + cy*cy + cz*cz);
-          if (cLen < 1e-10) continue;  // degenerate (collinear seeds)
+          if (cLen < 1e-10) continue;  // collinear seeds
 
           for (const sign of [1, -1]) {
             const vx = sign * cx / cLen;
             const vy = sign * cy / cLen;
             const vz = sign * cz / cLen;
 
-            // Accept only if v is s's nearest seed (no seed closer than s)
-            const vs = vx*s[0] + vy*s[1] + vz*s[2];
+            // Verify: no other seed is closer to v than seed i (they're all equal)
+            const ref = vx*a[0] + vy*a[1] + vz*a[2];
             let ok = true;
-            for (let ti = 0; ti < n; ti++) {
-              if (ti === si) continue;
-              const t = seedXYZ[ti];
-              if (vx*t[0] + vy*t[1] + vz*t[2] > vs + 1e-10) { ok = false; break; }
+            for (let t = 0; t < n; t++) {
+              if (t === i || t === j || t === k) continue;
+              const s = seedXYZ[t];
+              if (vx*s[0] + vy*s[1] + vz*s[2] > ref + 1e-10) { ok = false; break; }
             }
-            if (ok) verts.push([vx, vy, vz]);
+            if (!ok) continue;
+
+            // Share this exact vertex object with all three cells
+            const v = [vx, vy, vz];
+            cellVerts[i].push(v);
+            cellVerts[j].push(v);
+            cellVerts[k].push(v);
           }
         }
       }
+    }
 
+    const cells = {};
+    for (let si = 0; si < n; si++) {
+      const key = _toKey(seedList[si].id);
+      const verts = cellVerts[si];
       if (verts.length < 3) continue;
 
-      // Sort vertices by angle around the seed axis using a local tangent frame
+      const s = seedXYZ[si];
       let ux, uy, uz;
       if (Math.abs(s[2]) < 0.99) { ux = -s[1]; uy = s[0]; uz = 0; }
       else                        { ux = 1;      uy = 0;    uz = 0; }
