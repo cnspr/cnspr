@@ -6,6 +6,7 @@
   <title>Conspiracy</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="/libs/globe.gl/globe.gl.min.js"></script>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -65,7 +66,7 @@
         <button class="map-view-btn" data-view="unrest">Unrest</button>
         <button class="map-view-btn" data-view="prosperity">Prosperity</button>
       </div>
-      <canvas id="map-canvas"></canvas>
+      <div id="map-canvas"></div>
       <div id="map-selection" class="map-selection">
         <!-- Left panel: context-aware orders for the selected region -->
         <div id="region-orders" class="map-side-panel map-side-panel--left">

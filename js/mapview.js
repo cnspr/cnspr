@@ -1,47 +1,36 @@
 /**
- * mapview.js — Geographic world map rendered on a rotating orthographic globe.
+ * mapview.js — Globe renderer using globe.gl (WebGL / Three.js).
  *
  * Spec: docs/map.md
  *
- * Key behaviours:
- *  - Orthographic (globe) projection; drag rotates lon0/lat0
- *  - Delaunay triangulation computed from seed positions; Voronoi cells are its dual
- *  - Adjacency derived from Delaunay triangulation (no adjacency lists in map.json)
- *  - Zoom range: 0.5 … 8 (scales globe radius)
- *  - Input: mouse wheel, trackpad/touch pinch, keyboard +/-, touch drag, tap-to-select
- *  - devicePixelRatio-aware canvas sizing (§4.3)
+ * Public API (unchanged):
+ *   new MapView(container, onSelect)
+ *   .render(world)
+ *   .getAdjacentIds(regionId) → string[]
+ *   .deselect()
+ *   .setView(mode)
+ *   .selectById(regionId)
+ *
+ * Depends on globe.gl loaded as window.Globe before this module runs.
+ * Script: /libs/globe.gl/globe.gl.min.js
  */
-// (No external imports — Voronoi cells built from seed positions via Delaunay triangulation)
 
-// ── Colours (read from CSS custom properties defined in style.css) ───────────
-
+// ── CSS helpers ──────────────────────────────────────────────────────────────
 const _css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 
+const COL_OCEAN      = _css('--map-ocean')      || '#0a1020';
+const COL_LAND_DEF   = _css('--map-land')       || '#1a2030';
+const COL_BORDER     = _css('--map-border')     || '#2a3548';
+const COL_BORDER_HOV = _css('--map-border-hov') || '#4a6088';
+const COL_BORDER_SEL = _css('--map-border-sel') || '#8090c8';
+
 const FACTION_COLORS = {
-  federation: _css('--accent2'),
-  syndicate:  _css('--faction-syndicate'),
-  conspiracy: _css('--faction-conspiracy'),
+  federation: _css('--accent2')            || '#4a9eff',
+  syndicate:  _css('--faction-syndicate')  || '#e6a820',
+  conspiracy: _css('--faction-conspiracy') || '#9b59b6',
 };
-const COL_OCEAN      = _css('--map-ocean');
-const COL_LAND_DEF   = _css('--map-land');
-const COL_BORDER     = _css('--map-border');
-const COL_BORDER_HOV = _css('--map-border-hov');
-const COL_BORDER_SEL = _css('--map-border-sel');
-const COL_TEXT       = _css('--text');
-const COL_MUTED      = _css('--muted');
-const COL_UNREST_LO  = _css('--good');
-const COL_UNREST_MD  = _css('--warn');
-const COL_UNREST_HI  = _css('--danger');
 
-function unrestColor(u) {
-  if (u > 60) return COL_UNREST_HI;
-  if (u > 30) return COL_UNREST_MD;
-  return COL_UNREST_LO;
-}
-
-// ── Region seeds, keys, and cell polygons ─────────────────────────────────────
-// Keys: reg_* → strip "reg_" prefix; sea_* → kept as-is.
-// Geometry is built lazily from world.regions on first render() — no fetch needed.
+// ── Region ID key helper ────────────────────────────────────────────────────
 const _toKey = id => id.replace(/^reg_/, '');
 
 // ── 3-D convex hull (= spherical Delaunay triangulation) ─────────────────────
@@ -52,19 +41,11 @@ const _toKey = id => id.replace(/^reg_/, '');
 //
 // Algorithm: randomised incremental insertion with conflict lists
 // (de Berg et al. "Computational Geometry" §11.2).
-// Expected O(n log n) time: each insertion touches O(1) amortised faces; the
-// shuffle ensures the random-order guarantee; conflict lists give O(1) look-up
-// of the visible face set per insertion.
-//
-// pts    : array of [x,y,z] unit vectors
-// returns: array of [i,j,k] index triples, CCW from outside (outward-facing)
+// Expected O(n log n) time.
 function _convexHull3D(pts) {
   const n = pts.length;
   if (n < 4) return [];
 
-  // orient(a,b,c,d): signed volume of tet(a,b,c,d).
-  // Positive iff d is strictly above plane(a,b,c) — i.e. on the outward-normal side.
-  // Outward normal of face (a,b,c) = (b-a)×(c-a).
   const orient = (a,b,c,d) => {
     const pa=pts[a], pb=pts[b], pc=pts[c], pd=pts[d];
     const ux=pb[0]-pa[0], uy=pb[1]-pa[1], uz=pb[2]-pa[2];
@@ -73,11 +54,6 @@ function _convexHull3D(pts) {
     return ux*(vy*wz-vz*wy) - uy*(vx*wz-vz*wx) + uz*(vx*wy-vy*wx);
   };
 
-  // Face: { v:[a,b,c], adj:[-1,-1,-1], pts:Set<ptIdx>, alive:bool }
-  //   v  : vertex indices, listed CCW from outside the hull
-  //   adj[e]: id of the face sharing edge (v[e] → v[(e+1)%3]);
-  //           that face stores the edge in the opposite direction
-  //   pts: conflict list — uninserted point indices visible from this face
   const hull    = [];
   const F       = id => hull[id];
   const addF    = (a,b,c) => (hull.push({v:[a,b,c], adj:[-1,-1,-1], pts:new Set(), alive:true}), hull.length-1);
@@ -85,8 +61,7 @@ function _convexHull3D(pts) {
   const edgeOf  = (fi,u,v) => { const w=F(fi).v; for(let e=0;e<3;e++) if(w[e]===u&&w[(e+1)%3]===v)return e; return -1; };
   const visible = (fi,q)   => orient(F(fi).v[0], F(fi).v[1], F(fi).v[2], q) > 1e-10;
 
-  // ── Step 1: Initial tetrahedron ────────────────────────────────────────────
-  // Find four non-coplanar seeds to start with.
+  // ── Step 1: Initial tetrahedron ──────────────────────────────────────────
   let p0=0, p1=-1, p2=-1, p3=-1;
   for (let i=1; i<n&&p1<0; i++) {
     const a=pts[0], b=pts[i];
@@ -108,99 +83,54 @@ function _convexHull3D(pts) {
   }
   if (p3<0) return [];
 
-  // Four faces of the tetrahedron; fix winding so the opposite vertex is interior.
-  const tet = [addF(p0,p1,p2), addF(p0,p1,p3), addF(p0,p2,p3), addF(p1,p2,p3)];
-  const opp = [p3, p2, p1, p0];  // vertex opposite to each face
-  for (let i=0; i<4; i++) {
-    // If the opposite vertex is visible (above), the winding is inside-out — flip.
-    if (visible(tet[i], opp[i])) { const w=F(tet[i]).v; [w[1],w[2]]=[w[2],w[1]]; }
-  }
-  // Link each pair of tetrahedron faces across their shared edge.
-  for (let i=0; i<4; i++) for (let j=i+1; j<4; j++) {
-    for (let e=0; e<3; e++) {
-      const u=F(tet[i]).v[e], v=F(tet[i]).v[(e+1)%3];
-      const ej=edgeOf(tet[j],v,u);  // the shared edge runs opposite in the neighbour
-      if (ej>=0) { link(tet[i],e,tet[j],ej); break; }
-    }
-  }
+  const [f0,f1,f2,f3] = orient(p0,p1,p2,p3) > 0
+    ? [addF(p0,p1,p2), addF(p0,p3,p1), addF(p0,p2,p3), addF(p1,p3,p2)]
+    : [addF(p0,p2,p1), addF(p0,p1,p3), addF(p0,p3,p2), addF(p1,p2,p3)];
 
-  // ── Step 2: Initialise conflict lists ─────────────────────────────────────
-  // pConfl[pt] = Set<faceId> — faces visible from pt (not yet inserted)
-  // F(fi).pts  = Set<pt>     — uninserted points that see face fi
-  const tetSet = new Set([p0,p1,p2,p3]);
-  const rest   = Array.from({length:n}, (_,i)=>i).filter(i=>!tetSet.has(i));
+  link(f0,0,f1,2); link(f0,1,f3,2); link(f0,2,f2,0);
+  link(f1,0,f2,2); link(f1,1,f3,0); link(f2,1,f3,1);
+
+  // ── Step 2: Build initial conflict lists ─────────────────────────────────
   const pConfl = new Map();
-  for (const pt of rest) {
-    const s = new Set();
-    for (const fi of tet) if (visible(fi,pt)) { s.add(fi); F(fi).pts.add(pt); }
-    pConfl.set(pt, s);
+  const order  = Array.from({length:n},(_,i)=>i)
+    .filter(i=>i!==p0&&i!==p1&&i!==p2&&i!==p3)
+    .sort(()=>Math.random()-0.5);
+
+  for (const pt of order) {
+    pConfl.set(pt, new Set());
+    for (const fi of [f0,f1,f2,f3]) if (visible(fi,pt)) { F(fi).pts.add(pt); pConfl.get(pt).add(fi); }
   }
 
-  // ── Step 3: Randomised incremental insertion ───────────────────────────────
-  for (let i=rest.length-1; i>0; i--) {
-    const j=(Math.random()*(i+1))|0; [rest[i],rest[j]]=[rest[j],rest[i]];
-  }
+  // ── Step 3: Insert points ────────────────────────────────────────────────
+  for (const pt of order) {
+    const visFids = [...pConfl.get(pt)].filter(fi=>F(fi).alive && visible(fi,pt));
+    if (!visFids.length) continue;
 
-  for (const pt of rest) {
-    const seed = pConfl.get(pt);
-    if (!seed || seed.size===0) continue;  // interior point (cannot happen on sphere)
-
-    // BFS from conflict-list seed to collect all visible faces.
-    // The conflict list gives the starting set; BFS catches any neighbours missed
-    // by floating-point edge cases.
-    const visFids = new Set(seed);
-    const queue   = [...seed];
-    while (queue.length) {
-      const fi=queue.pop();
-      for (let e=0; e<3; e++) {
-        const fj=F(fi).adj[e];
-        if (fj>=0 && !visFids.has(fj) && F(fj).alive && visible(fj,pt)) {
-          visFids.add(fj); queue.push(fj);
-        }
-      }
-    }
-
-    // Horizon: edges of visible faces whose opposite neighbour is non-visible (or absent).
     const horizon = [];
     for (const fi of visFids) {
+      const {v,adj} = F(fi);
       for (let e=0; e<3; e++) {
-        const fj=F(fi).adj[e];
-        if (fj<0 || !visFids.has(fj)) {
-          const u=F(fi).v[e], v=F(fi).v[(e+1)%3];
-          horizon.push({u, v, fAdj:fj, eAdj: fj>=0 ? edgeOf(fj,v,u) : -1});
-        }
+        const fAdj=adj[e];
+        if (fAdj<0 || !visFids.includes(fAdj)) horizon.push({u:v[e], v:v[(e+1)%3], fAdj});
       }
     }
 
-    // New cone face per horizon edge.
-    // Horizon edge (u→v) belongs to a visible face; the new face is (v,u,pt) — CCW from outside.
-    //   edge 0 = v→u  (base, links to fAdj)
-    //   edge 1 = u→pt
-    //   edge 2 = pt→v
-    const newFids = horizon.map(({u,v,fAdj,eAdj}) => {
-      const fi=addF(v,u,pt);
-      if (fAdj>=0 && eAdj>=0) link(fi,0,fAdj,eAdj);
-      return fi;
-    });
-
-    // Link cone faces to each other around pt.
-    // Face A (v_A, u_A, pt): edge 1=(u_A→pt) links to edge 2=(pt→v_B) of face B
-    // where B's base vertex v_B === u_A.
-    const vStart = new Map(horizon.map(({v},i) => [v, newFids[i]]));
+    const newFids = horizon.map(({u,v}) => addF(pt,u,v));
     for (let i=0; i<horizon.length; i++) {
-      const fk=vStart.get(horizon[i].u);
-      if (fk!==undefined) link(newFids[i],1, fk,2);
+      const next=(i+1)%horizon.length;
+      link(newFids[i],1, newFids[next],2);
+      const fAdj=horizon[i].fAdj;
+      if (fAdj>=0) {
+        const e=edgeOf(fAdj,horizon[i].v,horizon[i].u);
+        if (e>=0) link(newFids[i],0,fAdj,e);
+      }
     }
 
-    // Update conflict lists for new faces.
-    // Key property (de Berg §11.2): any point visible from new face (v,u,pt) must
-    // have been visible from either fAdj or from the visible face that owned edge (u→v).
-    // → candidate set = union of those two conflict lists, filtered by visibility.
     for (let i=0; i<horizon.length; i++) {
-      const {u, v, fAdj}=horizon[i], fi=newFids[i];
+      const fi=newFids[i];
       let fVisPts=new Set();
-      for (const fv of visFids) { if (edgeOf(fv,u,v)>=0) { fVisPts=F(fv).pts; break; } }
-      const cands = fAdj>=0 ? new Set([...fVisPts, ...F(fAdj).pts]) : fVisPts;
+      for (const fv of visFids) { if (edgeOf(fv,horizon[i].u,horizon[i].v)>=0) { fVisPts=F(fv).pts; break; } }
+      const cands = horizon[i].fAdj>=0 ? new Set([...fVisPts, ...F(horizon[i].fAdj).pts]) : fVisPts;
       for (const q of cands) {
         if (q!==pt && pConfl.has(q) && visible(fi,q)) {
           F(fi).pts.add(q); pConfl.get(q).add(fi);
@@ -208,7 +138,6 @@ function _convexHull3D(pts) {
       }
     }
 
-    // Remove visible faces; scrub them from every surviving point's conflict list.
     for (const fv of visFids) {
       for (const q of F(fv).pts) { if (q!==pt && pConfl.has(q)) pConfl.get(q).delete(fv); }
       F(fv).alive=false;
@@ -220,17 +149,6 @@ function _convexHull3D(pts) {
 }
 
 // ── Spherical Delaunay triangulation ─────────────────────────────────────────
-//
-// Wraps _convexHull3D: extracts Voronoi vertices and the adjacency graph.
-//
-// Voronoi vertex of Delaunay triangle (i,j,k) = outward unit normal of the
-// convex hull face = normalize((b-a)×(c-a)).
-// Proof of equidistance: N=(b-a)×(c-a) is perpendicular to both (b-a) and
-// (c-a), so N·a = N·b = N·c, i.e. normalize(N) has equal dot-product with
-// a, b, c — equal geodesic distance on the unit sphere.
-//
-// seedList  : array of region objects with .id
-// seedXYZ   : parallel array of [x,y,z] unit vectors
 function _delaunay(seedList, seedXYZ) {
   const n        = seedList.length;
   const cellVerts = Array.from({ length: n }, () => []);
@@ -238,7 +156,6 @@ function _delaunay(seedList, seedXYZ) {
 
   for (const [i,j,k] of _convexHull3D(seedXYZ)) {
     const a=seedXYZ[i], b=seedXYZ[j], c=seedXYZ[k];
-    // Outward unit normal = Voronoi vertex shared by cells i, j, k
     const nx=(b[1]-a[1])*(c[2]-a[2])-(b[2]-a[2])*(c[1]-a[1]);
     const ny=(b[2]-a[2])*(c[0]-a[0])-(b[0]-a[0])*(c[2]-a[2]);
     const nz=(b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);
@@ -258,10 +175,41 @@ function _delaunay(seedList, seedXYZ) {
   return { cellVerts, adjacency };
 }
 
-// ── Voronoi cells from Delaunay output ───────────────────────────────────────
-//
-// Each cell is the angular-sorted convex hull of the Delaunay vertices belonging
-// to that seed, projected back to lon/lat and edge-subdivided along great circles.
+// ── Spherical geometry helpers ───────────────────────────────────────────────
+function _toXYZ(lon, lat) {
+  const φ = lat * Math.PI / 180, λ = lon * Math.PI / 180;
+  return [Math.cos(φ)*Math.cos(λ), Math.cos(φ)*Math.sin(λ), Math.sin(φ)];
+}
+
+function _fromXYZ(x, y, z) {
+  return [Math.atan2(y, x) * 180/Math.PI, Math.asin(z) * 180/Math.PI];
+}
+
+/** Subdivide polygon edges along great circle arcs (≤ maxDeg° per segment). */
+function _subdividePoly(poly, maxDeg = 4) {
+  const out = [];
+  for (let i = 0, n = poly.length - 1; i < n; i++) {
+    const p1 = poly[i], p2 = poly[i + 1];
+    const v1 = _toXYZ(p1[0], p1[1]), v2 = _toXYZ(p2[0], p2[1]);
+    const dot = Math.max(-1, Math.min(1, v1[0]*v2[0] + v1[1]*v2[1] + v1[2]*v2[2]));
+    const θ   = Math.acos(dot);
+    const segs = Math.max(1, Math.ceil(θ * 180/Math.PI / maxDeg));
+    for (let j = 0; j < segs; j++) {
+      const t = j / segs;
+      if (θ < 1e-6) { out.push(p1); continue; }
+      const s = Math.sin(θ);
+      const w1 = Math.sin((1 - t) * θ) / s, w2 = Math.sin(t * θ) / s;
+      out.push(_fromXYZ(
+        w1*v1[0] + w2*v2[0],
+        w1*v1[1] + w2*v2[1],
+        w1*v1[2] + w2*v2[2],
+      ));
+    }
+  }
+  return out;
+}
+
+// ── Voronoi cells from Delaunay output ────────────────────────────────────────
 //
 // Called once on first render() with world.regions as input.
 function _buildGeo(regions) {
@@ -301,140 +249,7 @@ function _buildGeo(regions) {
   return { seeds, geoKeys, geoCells, adjacency };
 }
 
-// Match a game region to its seed entry in the seeds map.
-function findGeo(id, name, seeds, geoKeys) {
-  const norm = s => (s ?? '').toLowerCase()
-    .replace(/^reg_/, '').replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
-  const nid   = norm(id);
-  const nname = norm(name);
-
-  if (seeds.has(nid))   return seeds.get(nid);
-  if (seeds.has(nname)) return seeds.get(nname);
-
-  for (const key of geoKeys) {
-    if (key.length >= 5 && nid.length >= 5 && (nid === key || nid.includes(key) || key.includes(nid)))
-      return seeds.get(key);
-  }
-
-  const ALIAS = {
-    usa: 'usa_midwest', america: 'usa_midwest',
-    russia: 'russia_northwest', siberia: 'siberia_west',
-    china: 'china_north', japan: 'japan_central',
-    india: 'india_north', africa: 'nigeria',
-    uk: 'england_wales', britain: 'england_wales',
-    france: 'france_north', germany: 'germany_north',
-    iran: 'iran_north', turkey: 'turkey_west',
-    korea: 'korea_south', australia: 'australia_south',
-    brazil: 'brazil_central', mexico: 'mexico',
-    canada: 'canada_west', argentina: 'argentina',
-  };
-  for (const [alias, geoKey] of Object.entries(ALIAS)) {
-    if (nname.includes(alias) || nid.includes(alias)) {
-      const seed = seeds.get(geoKey);
-      if (seed) return seed;
-    }
-  }
-  return null;
-}
-
-// ── Projection ───────────────────────────────────────────────────────────────
-//
-// Orthographic projection centred at (lon0, lat0).
-// Returns {x, y} in screen pixels, or null if the point is on the back hemisphere.
-
-/**
- * Projects (lon, lat) to canvas (x, y) via orthographic projection centred at (lon0, lat0).
- * Returns null for back-hemisphere points unless `force` is true.
- * Pass force=true for already-clipped polygons where the canvas clip handles edge cases.
- */
-function projectOrtho(lon, lat, lon0, lat0, R, cx, cy, force = false) {
-  const toRad = Math.PI / 180;
-  const φ  = lat  * toRad;
-  const φ0 = lat0 * toRad;
-  const Δλ = (lon - lon0) * toRad;
-  const cosC = Math.sin(φ0) * Math.sin(φ) + Math.cos(φ0) * Math.cos(φ) * Math.cos(Δλ);
-  if (!force && cosC < 0) return null;
-  return {
-    x: cx + R * Math.cos(φ) * Math.sin(Δλ),
-    y: cy - R * (Math.cos(φ0) * Math.sin(φ) - Math.sin(φ0) * Math.cos(φ) * Math.cos(Δλ)),
-  };
-}
-
-// ── Point-in-polygon (ray casting, lon/lat space) ────────────────────────────
-
-function pointInPolyLonLat(lon, lat, poly) {
-  let inside = false;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const [xi, yi] = poly[i];
-    const [xj, yj] = poly[j];
-    if (((yi > lat) !== (yj > lat)) &&
-        (lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi))
-      inside = !inside;
-  }
-  return inside;
-}
-
-// ── Spherical geometry helpers ────────────────────────────────────────────────
-
-function _toXYZ(lon, lat) {
-  const φ = lat * Math.PI / 180, λ = lon * Math.PI / 180;
-  return [Math.cos(φ)*Math.cos(λ), Math.cos(φ)*Math.sin(λ), Math.sin(φ)];
-}
-
-function _fromXYZ(x, y, z) {
-  return [Math.atan2(y, x) * 180/Math.PI, Math.asin(z) * 180/Math.PI];
-}
-
-/** Subdivide a closed d3-delaunay polygon along great circle arcs (≤ maxDeg° per segment). */
-function _subdividePoly(poly, maxDeg = 4) {
-  const out = [];
-  for (let i = 0, n = poly.length - 1; i < n; i++) {
-    const p1 = poly[i], p2 = poly[i + 1];
-    const v1 = _toXYZ(p1[0], p1[1]), v2 = _toXYZ(p2[0], p2[1]);
-    const dot = Math.max(-1, Math.min(1, v1[0]*v2[0] + v1[1]*v2[1] + v1[2]*v2[2]));
-    const θ   = Math.acos(dot);
-    const segs = Math.max(1, Math.ceil(θ * 180/Math.PI / maxDeg));
-    for (let j = 0; j < segs; j++) {
-      const t = j / segs;
-      if (θ < 1e-6) { out.push(p1); continue; }
-      const s = Math.sin(θ);
-      const w1 = Math.sin((1 - t) * θ) / s, w2 = Math.sin(t * θ) / s;
-      out.push(_fromXYZ(
-        w1*v1[0] + w2*v2[0],
-        w1*v1[1] + w2*v2[1],
-        w1*v1[2] + w2*v2[2],
-      ));
-    }
-  }
-  return out;
-}
-
-/**
- * Sutherland-Hodgman clip of a polygon to the visible hemisphere facing (lon0, lat0).
- * Returns an open polygon suitable for closePath() rendering.
- */
-function _clipHemisphere(poly, lon0, lat0) {
-  const N   = _toXYZ(lon0, lat0);
-  const dN  = p => { const q = _toXYZ(p[0], p[1]); return N[0]*q[0] + N[1]*q[1] + N[2]*q[2]; };
-  const out = [];
-  for (let i = 0; i < poly.length; i++) {
-    const P1 = poly[i], P2 = poly[(i + 1) % poly.length];
-    const d1 = dN(P1),  d2 = dN(P2);
-    if (d1 > 0) out.push(P1);
-    if ((d1 > 0) !== (d2 > 0)) {
-      const a = _toXYZ(P1[0], P1[1]), b = _toXYZ(P2[0], P2[1]);
-      const t  = d1 / (d1 - d2);
-      const ix = a[0]+t*(b[0]-a[0]), iy = a[1]+t*(b[1]-a[1]), iz = a[2]+t*(b[2]-a[2]);
-      const len = Math.sqrt(ix*ix + iy*iy + iz*iz);
-      out.push(_fromXYZ(ix/len, iy/len, iz/len));
-    }
-  }
-  return out;
-}
-
-// ── Faction influence helpers ─────────────────────────────────────────────────
-
-/** Returns the faction_id with the highest influence share, or null. */
+// ── Faction influence ────────────────────────────────────────────────────────
 function dominantFaction(region) {
   const inf = region.faction_influence ?? {};
   let best = null, bestVal = -1;
@@ -444,15 +259,7 @@ function dominantFaction(region) {
   return best;
 }
 
-// ── View-mode colour helpers ──────────────────────────────────────────────────
-
-const VIEWS = {
-  political:  { label: 'Political',  legend: null },
-  population: { label: 'Population', legend: [['Low','#1a3a5c'],['High','#00d4ff']] },
-  unrest:     { label: 'Unrest',     legend: [['Low','#27ae60'],['Mid','#e67e22'],['High','#c0392b']] },
-  prosperity: { label: 'Prosperity', legend: [['Low','#c0392b'],['Mid','#e67e22'],['High','#27ae60']] },
-};
-
+// ── Colour helpers ───────────────────────────────────────────────────────────
 function lerp(a, b, t) { return a + (b - a) * t; }
 
 function heatColor(value, lo, hi, fromHex, toHex) {
@@ -467,576 +274,290 @@ function threeStopColor(value, lo, mid, hi, colLo, colMid, colHi) {
   return heatColor(value, mid, hi, colMid, colHi);
 }
 
-// ── Constants ────────────────────────────────────────────────────────────────
+/** Convert any CSS colour string to rgba(…, alpha). */
+function _withAlpha(color, alpha) {
+  if (!color) return `rgba(26,32,48,${alpha})`;
+  if (color.startsWith('#') && color.length >= 7) {
+    const r = parseInt(color.slice(1,3), 16);
+    const g = parseInt(color.slice(3,5), 16);
+    const b = parseInt(color.slice(5,7), 16);
+    if (!isNaN(r)) return `rgba(${r},${g},${b},${alpha})`;
+  }
+  return color;   // pass through rgb/rgba
+}
 
-const MIN_ZOOM = 0.5;
-const MAX_ZOOM = 8;
-
-// ── MapView ──────────────────────────────────────────────────────────────────
+// ── MapView ───────────────────────────────────────────────────────────────────
 
 export class MapView {
-  constructor(canvas, onSelect) {
-    this.canvas   = canvas;
-    this.ctx      = canvas.getContext('2d');
-    this.onSelect = onSelect;
+  /**
+   * @param {HTMLElement} container  — div that globe.gl will render into
+   * @param {Function}    onSelect   — called with (region|null) on click
+   */
+  constructor(container, onSelect) {
+    this._container     = container;
+    this.onSelect       = onSelect;
+    this._world         = null;
+    this._seeds         = null;
+    this._geoKeys       = null;
+    this._geoCells      = null;
+    this._adjacency     = null;
+    this._features      = [];
+    this._regById       = {};
+    this._factionColors = {};
+    this._selected      = null;
+    this._hovered       = null;
+    this._view          = 'political';
 
-    this._world      = null;
-    this._seeds      = null;   // Map<key, region> — built from world.regions on first render
-    this._geoKeys    = null;   // string[] — renderable (non-sea) keys
-    this._geoCells   = null;   // { [key]: [[lon,lat],...] } — Voronoi cells
-    this._adjacency  = null;   // Map<regionId, regionId[]> — from Delaunay triangulation
-    this._entries  = [];   // { region, key, cLon, cLat }
-    this._allGeo   = [];   // { key, poly, cLon, cLat }
-    this._selected = null;
-    this._hovered  = null;
-    this._view     = 'political';
+    const G = window.Globe;
+    if (!G) throw new Error('globe.gl not loaded (window.Globe is undefined)');
 
-    // Zoom / pan state (in logical/CSS pixels)
-    this._zoom  = 1;
-    this._panX  = 0;   // unclamped; normalised in _draw / _hitTest
-    this._panY  = 0;
+    // Solid-colour texture for the ocean sphere
+    const texCanvas = Object.assign(document.createElement('canvas'), { width: 2, height: 2 });
+    texCanvas.getContext('2d').fillStyle = COL_OCEAN;
+    texCanvas.getContext('2d').fillRect(0, 0, 2, 2);
 
-    // Drag state
-    this._drag  = null;   // { startX, startY, panX0, panY0, moved }
-    this._pinch = null;   // { dist0, zoom0, panX0, panY0 }
+    this._globe = G({ animateIn: false })(container);
+    this._globe
+      .width(container.clientWidth  || 600)
+      .height(container.clientHeight || 400)
+      .backgroundColor('rgba(0,0,0,0)')
+      .globeImageUrl(texCanvas.toDataURL())
+      .showAtmosphere(true)
+      .atmosphereColor('#1a3a6c')
+      .atmosphereAltitude(0.12)
+      // Polygons
+      .polygonsData([])
+      .polygonCapColor(d => this._capColor(d))
+      .polygonSideColor(() => 'rgba(0,0,0,0.3)')
+      .polygonStrokeColor(d => this._strokeColor(d))
+      .polygonAltitude(d => d.properties?.id === this._selected ? 0.012 : 0.001)
+      .polygonLabel(d => this._tooltip(d))
+      .onPolygonClick(polygon => {
+        if (!polygon) return;
+        const region = this._regById[polygon.properties.id];
+        if (region) {
+          this._selected = region.id;
+          this._refresh();
+          this.onSelect(region);
+        }
+      })
+      .onPolygonHover(polygon => {
+        const id = polygon?.properties?.id ?? null;
+        if (id !== this._hovered) {
+          this._hovered = id;
+          this._refresh();
+        }
+      })
+      .onGlobeClick(() => {
+        if (this._selected !== null) {
+          this._selected = null;
+          this._refresh();
+          this.onSelect(null);
+        }
+      })
+      // Labels
+      .labelsData([])
+      .labelLat(d => d.lat)
+      .labelLng(d => d.lng)
+      .labelText(d => d.name)
+      .labelSize(0.35)
+      .labelColor(() => 'rgba(212,212,232,0.85)')
+      .labelDotRadius(0)
+      .labelResolution(2)
+      .labelAltitude(0.003)
+      // HTML badges (armies, heroes)
+      .htmlElementsData([])
+      .htmlElement(d => {
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'display:flex;gap:3px;pointer-events:none';
+        if (d.armies) {
+          const s = document.createElement('span');
+          s.style.cssText = 'background:#e74c3c;color:#fff;font:bold 9px system-ui;padding:1px 4px;border-radius:3px';
+          s.textContent = `⚔${d.armies}`;
+          wrap.appendChild(s);
+        }
+        if (d.heroes) {
+          const s = document.createElement('span');
+          s.style.cssText = 'background:#f39c12;color:#fff;font:bold 9px system-ui;padding:1px 4px;border-radius:3px';
+          s.textContent = `★${d.heroes}`;
+          wrap.appendChild(s);
+        }
+        return wrap;
+      })
+      .htmlLat(d => d.lat)
+      .htmlLng(d => d.lng)
+      .htmlAltitude(0.05);
 
-    // Keyboard zoom
-    this._keyHandler = e => this._onKey(e);
-    document.addEventListener('keydown', this._keyHandler);
-
-    canvas.addEventListener('click',      e => this._onClick(e));
-    canvas.addEventListener('mousemove',  e => this._onMouseMove(e));
-    canvas.addEventListener('mousedown',  e => this._onMouseDown(e));
-    canvas.addEventListener('mouseup',    () => this._onMouseUp());
-    canvas.addEventListener('mouseleave', () => { this._drag = null; this._hovered = null; this._draw(); });
-    canvas.addEventListener('wheel',      e => this._onWheel(e), { passive: false });
-
-    canvas.addEventListener('touchstart', e => this._onTouchStart(e), { passive: false });
-    canvas.addEventListener('touchmove',  e => this._onTouchMove(e),  { passive: false });
-    canvas.addEventListener('touchend',   e => this._onTouchEnd(e),   { passive: false });
-
-    this._ro = new ResizeObserver(() => this._layout());
-    this._ro.observe(canvas.parentElement ?? canvas);
+    // Keep globe sized to container
+    this._ro = new ResizeObserver(() => {
+      this._globe
+        .width(container.clientWidth)
+        .height(container.clientHeight);
+    });
+    this._ro.observe(container);
   }
 
-  // ── Public API ────────────────────────────────────────────────────────────
+  // ── Public API ─────────────────────────────────────────────────────────────
 
   render(world) {
-    this._world    = world;
-    this._selected = null;
+    this._world         = world;
+    this._regById       = {};
+    this._factionColors = {};
+    for (const r of (world.regions  ?? [])) this._regById[r.id] = r;
+    for (const f of (world.factions ?? [])) {
+      this._factionColors[f.id] = FACTION_COLORS[f.type] ?? COL_LAND_DEF;
+    }
+
     if (!this._seeds) {
       const { seeds, geoKeys, geoCells, adjacency } = _buildGeo(world.regions ?? []);
-      this._seeds      = seeds;
-      this._geoKeys    = geoKeys;
-      this._geoCells   = geoCells;
-      this._adjacency  = adjacency;
+      this._seeds     = seeds;
+      this._geoKeys   = geoKeys;
+      this._geoCells  = geoCells;
+      this._adjacency = adjacency;
+
+      // Build GeoJSON features once — geometry never changes
+      this._features = geoKeys
+        .filter(key => geoCells[key])
+        .map(key => {
+          const region = seeds.get(key);
+          const ring   = geoCells[key];
+          // GeoJSON Polygon rings must be closed (first === last)
+          const coords = [...ring, ring[0]];
+          return {
+            type: 'Feature',
+            geometry: { type: 'Polygon', coordinates: [coords] },
+            properties: { key, id: region.id, name: region.name },
+          };
+        });
+
+      // One label per land region
+      this._globe.labelsData(
+        geoKeys.map(key => {
+          const r = seeds.get(key);
+          return { lat: r.lat, lng: r.lon, name: r.name };
+        }),
+      );
     }
-    this._layout();
+
+    // Sync current game-state into feature properties
+    for (const f of this._features) {
+      const r = this._regById[f.properties.id];
+      if (r) {
+        f.properties.faction_influence = r.faction_influence ?? {};
+        f.properties.population        = r.population ?? 0;
+        f.properties.unrest            = r.unrest      ?? 0;
+        f.properties.prosperity        = r.prosperity  ?? 0;
+      }
+    }
+    this._globe.polygonsData(this._features);
+    this._updateBadges();
   }
 
-  /** Returns the full region IDs adjacent to regionId, computed from Delaunay triangulation. */
+  /** Returns full region IDs adjacent to regionId (from Delaunay triangulation). */
   getAdjacentIds(regionId) {
     return this._adjacency?.get(regionId) ?? [];
   }
 
   deselect() {
     this._selected = null;
-    this._draw();
+    this._refresh();
   }
 
   setView(mode) {
-    if (!VIEWS[mode]) return;
+    if (!['political','population','unrest','prosperity'].includes(mode)) return;
     this._view = mode;
-    this._draw();
+    this._refresh();
   }
 
-  /** Select a region by game ID and rotate the globe to centre on it. */
+  /** Select a region by game ID and fly the camera to it. */
   selectById(regionId) {
-    const entry = this._entries.find(e => e.region.id === regionId);
-    if (!entry) return;
+    const region = this._regById[regionId];
+    if (!region) return;
     this._selected = regionId;
-    this._panX = entry.cLon;
-    this._panY = entry.cLat;
-    this._clampPanY();
-    this.onSelect(entry.region);
-    this._draw();
+    this._refresh();
+    this.onSelect(region);
+    this._globe.pointOfView({ lat: region.lat, lng: region.lon, altitude: 1.5 }, 800);
   }
 
-  // ── Layout ────────────────────────────────────────────────────────────────
+  // ── Internal ──────────────────────────────────────────────────────────────
 
-  _layout() {
-    // Clear explicit styles so flex assigns the canvas its natural allocated size
-    this.canvas.style.width  = '';
-    this.canvas.style.height = '';
-    const W = Math.max(this.canvas.clientWidth,  400);
-    const H = Math.max(this.canvas.clientHeight, 250);
-    const dpr = window.devicePixelRatio || 1;
-
-    // Physical canvas size
-    this.canvas.width  = Math.round(W * dpr);
-    this.canvas.height = Math.round(H * dpr);
-    this.canvas.style.width  = W + 'px';
-    this.canvas.style.height = H + 'px';
-
-    // All draw calls use logical (CSS) pixel coordinates
-    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    // Use pre-computed Voronoi cells — projected per-frame in _draw()
-    this._allGeo = (this._geoKeys ?? [])
-      .filter(key => this._geoCells[key])
-      .map(key => {
-        const seed = this._seeds.get(key);
-        return {
-          key,
-          poly: this._geoCells[key],   // [[lon, lat], ...] Voronoi cell
-          cLon: seed.lon,
-          cLat: seed.lat,
-        };
-      });
-
-    this._entries = (this._world?.regions ?? []).map(r => {
-      const key  = r.id.replace(/^reg_/, '');
-      const seed = this._seeds.get(key) ?? findGeo(r.id, r.name, this._seeds, this._geoKeys);
-      if (!seed) return null;
-      const cLon = r.lon  != null ? r.lon  : seed.lon;
-      const cLat = r.lat  != null ? r.lat  : seed.lat;
-      return { region: r, key, cLon, cLat };
-    }).filter(Boolean);
-
-    // Index for O(1) lookup in _hitTest
-    this._byKey = {};
-    for (const e of this._entries) this._byKey[e.key] = e;
-
-    this._clampPanY();
-    this._draw();
+  /** Trigger globe.gl to re-evaluate colour and altitude accessors. */
+  _refresh() {
+    this._globe
+      .polygonCapColor(d => this._capColor(d))
+      .polygonStrokeColor(d => this._strokeColor(d))
+      .polygonAltitude(d => d.properties?.id === this._selected ? 0.012 : 0.001);
   }
 
-  // ── Coordinate helpers ────────────────────────────────────────────────────
+  _capColor(d) {
+    const p     = d.properties;
+    const isSel = p.id === this._selected;
+    const isHov = p.id === this._hovered;
+    const alpha = isSel || isHov ? 0.95 : 0.72;
 
-  /** Logical canvas size in CSS pixels. */
-  _logSize() {
-    return {
-      W: this.canvas.width  / (window.devicePixelRatio || 1),
-      H: this.canvas.height / (window.devicePixelRatio || 1),
-    };
-  }
-
-  /** Globe radius in logical pixels at current zoom. */
-  _globeR(W, H) { return Math.max(10, Math.min(W, H) / 2 * this._zoom - 4); }
-
-  /** Normalise lon0 to [-180, 180] after long drag sessions. */
-  _normalisePanX() {
-    this._panX = ((this._panX + 180) % 360 + 360) % 360 - 180;
-  }
-
-  /** Clamp lat0 so the poles stay on the globe. */
-  _clampPanY() {
-    this._panY = Math.max(-85, Math.min(85, this._panY));
-  }
-
-  // ── Rendering ─────────────────────────────────────────────────────────────
-
-  _draw() {
-    const { W, H } = this._logSize();
-    const ctx  = this.ctx;
-    const cx   = W / 2, cy = H / 2;
-    const R    = this._globeR(W, H);
-    const lon0 = this._panX, lat0 = this._panY;
-
-    ctx.clearRect(0, 0, W, H);
-
-    // Ocean sphere
-    ctx.beginPath();
-    ctx.arc(cx, cy, R, 0, Math.PI * 2);
-    ctx.fillStyle = COL_OCEAN;
-    ctx.fill();
-
-    // Clip all land drawing to the globe disc
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(cx, cy, R, 0, Math.PI * 2);
-    ctx.clip();
-
-    if (!this._world) {
-      this._drawEmpty(ctx, lon0, lat0, R, cx, cy);
-    } else {
-      const factionCol = this._factionColorMap();
-      const armies     = this._indexBy(this._world.armies ?? [], 'region_id');
-      const heroes     = this._indexBy(this._world.heroes ?? [], 'region_id');
-
-      for (const { key, poly, cLon, cLat } of this._allGeo) {
-        const clipped = _clipHemisphere(poly, lon0, lat0);
-        if (clipped.length < 3) continue;
-
-        const ge    = this._byKey[key];
-        const isSel = ge && this._selected === ge.region.id;
-        const isHov = ge && this._hovered  === ge.region.id;
-        const fill  = ge ? this._regionFill(ge.region, factionCol, isHov) : COL_LAND_DEF;
-
-        const pts = clipped.map(([lo, la]) => projectOrtho(lo, la, lon0, lat0, R, cx, cy, true));
-
-        if (isSel) {
-          ctx.shadowColor = factionCol[dominantFaction(ge.region)] ?? '#7070b0';
-          ctx.shadowBlur  = 16;
-        }
-
-        ctx.beginPath();
-        pts.forEach(({ x, y }, i) => i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y));
-        ctx.closePath();
-        ctx.fillStyle = fill;
-        ctx.fill();
-        ctx.shadowBlur = 0;
-
-        ctx.strokeStyle = isSel ? COL_BORDER_SEL : isHov ? COL_BORDER_HOV : COL_BORDER;
-        ctx.lineWidth   = isSel ? 1.5 : 0.5;
-        ctx.stroke();
-      }
-
-      // Overlays (labels, badges)
-      for (const { region, cLon, cLat } of this._entries) {
-        const pt = projectOrtho(cLon, cLat, lon0, lat0, R, cx, cy);
-        if (!pt) continue;
-        this._drawOverlay(ctx, region, pt.x, pt.y,
-          this._hovered  === region.id,
-          this._selected === region.id,
-          armies[region.id] ?? [],
-          heroes[region.id] ?? []);
-      }
-    }
-
-    ctx.restore();
-
-    // Globe rim
-    ctx.beginPath();
-    ctx.arc(cx, cy, R, 0, Math.PI * 2);
-    ctx.strokeStyle = '#243456';
-    ctx.lineWidth   = 1;
-    ctx.stroke();
-
-    if (!this._world) {
-      ctx.fillStyle    = COL_MUTED;
-      ctx.font         = '14px system-ui';
-      ctx.textAlign    = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('No world data — complete setup or wait for turn 1.', cx, cy);
-    }
-  }
-
-  _drawEmpty(ctx, lon0, lat0, R, cx, cy) {
-    for (const { poly } of this._allGeo) {
-      const clipped = _clipHemisphere(poly, lon0, lat0);
-      if (clipped.length < 3) continue;
-      const pts = clipped.map(([lo, la]) => projectOrtho(lo, la, lon0, lat0, R, cx, cy, true));
-      ctx.beginPath();
-      pts.forEach(({ x, y }, i) => i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y));
-      ctx.closePath();
-      ctx.fillStyle   = COL_LAND_DEF;
-      ctx.fill();
-      ctx.strokeStyle = COL_BORDER;
-      ctx.lineWidth   = 0.5;
-      ctx.stroke();
-    }
-  }
-
-  _drawOverlay(ctx, region, cx, cy, isHov, isSel, armies, heroes) {
-    const unrest = region.unrest ?? 0;
-
-    if (unrest > 0) {
-      ctx.beginPath();
-      ctx.arc(cx, cy - 14, 4, 0, Math.PI * 2);
-      ctx.fillStyle = unrestColor(unrest);
-      ctx.fill();
-    }
-
-    ctx.textAlign    = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.font         = `${isSel ? 'bold ' : ''}10px system-ui`;
-    ctx.fillStyle    = isHov || isSel ? COL_TEXT : 'rgba(212,212,232,0.8)';
-    ctx.fillText(region.name ?? region.id, cx, cy);
-
-    const pop = region.population >= 1000
-      ? `${(region.population / 1000).toFixed(1)}B`
-      : `${region.population}M`;
-    ctx.font      = '8px system-ui';
-    ctx.fillStyle = isHov || isSel ? COL_MUTED : 'rgba(104,120,160,0.6)';
-    ctx.fillText(pop, cx, cy + 11);
-
-    let bx = cx + 22;
-    if (armies.length) { this._badge(ctx, bx, cy - 18, `⚔${armies.length}`, '#e74c3c'); bx += 26; }
-    if (heroes.length) { this._badge(ctx, bx, cy - 18, `★${heroes.length}`, '#f39c12'); }
-  }
-
-  _badge(ctx, x, y, text, color) {
-    ctx.fillStyle = color;
-    _roundRect(ctx, x - 10, y - 7, 22, 14, 4);
-    ctx.fill();
-    ctx.fillStyle    = '#fff';
-    ctx.font         = 'bold 8px system-ui';
-    ctx.textAlign    = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(text, x + 1, y);
-  }
-
-  _regionFill(region, factionCol, isHov) {
-    const dim = c => this._dim(c, isHov ? 1 : 0.55);
     switch (this._view) {
       case 'population': {
-        const pop = region.population ?? 0;
-        const col = heatColor(Math.log10(Math.max(pop, 1)), 0, Math.log10(1400), '#1a3a5c', '#00d4ff');
-        return isHov ? col : this._dim(col, 0.75);
+        const pop = p.population ?? 0;
+        return _withAlpha(
+          heatColor(Math.log10(Math.max(pop, 1)), 0, Math.log10(1400), '#1a3a5c', '#00d4ff'),
+          alpha,
+        );
       }
-      case 'unrest': {
-        const u = region.unrest ?? 0;
-        const col = threeStopColor(u, 0, 40, 80, '#27ae60', '#e67e22', '#c0392b');
-        return isHov ? col : this._dim(col, 0.75);
+      case 'unrest':
+        return _withAlpha(
+          threeStopColor(p.unrest ?? 0, 0, 40, 80, '#27ae60', '#e67e22', '#c0392b'),
+          alpha,
+        );
+      case 'prosperity':
+        return _withAlpha(
+          threeStopColor(p.prosperity ?? 0, 0, 50, 100, '#c0392b', '#e67e22', '#27ae60'),
+          alpha,
+        );
+      default: { // political
+        const fid  = dominantFaction({ faction_influence: p.faction_influence ?? {} });
+        const base = this._factionColors[fid] ?? COL_LAND_DEF;
+        return _withAlpha(base, alpha);
       }
-      case 'prosperity': {
-        const p = region.prosperity ?? 0;
-        const col = threeStopColor(p, 0, 50, 100, '#c0392b', '#e67e22', '#27ae60');
-        return isHov ? col : this._dim(col, 0.75);
-      }
-      default: {  // political — colour by dominant faction
-        const base = factionCol[dominantFaction(region)] ?? COL_LAND_DEF;
-        return dim(base);
-      }
     }
   }
 
-  _dim(hex, factor) {
-    if (!hex?.startsWith('#') || hex.length < 7) return COL_LAND_DEF;
-    const r = parseInt(hex.slice(1, 3), 16);
-    const g = parseInt(hex.slice(3, 5), 16);
-    const b = parseInt(hex.slice(5, 7), 16);
-    if (isNaN(r)) return COL_LAND_DEF;
-    return `rgb(${Math.round(r * factor)},${Math.round(g * factor)},${Math.round(b * factor)})`;
+  _strokeColor(d) {
+    const id = d.properties?.id;
+    if (id === this._selected) return COL_BORDER_SEL;
+    if (id === this._hovered)  return COL_BORDER_HOV;
+    return COL_BORDER;
   }
 
-  // ── Hit test ──────────────────────────────────────────────────────────────
-  //
-  // Inverse-project screen (sx, sy) to (lon, lat), then test all geo polygons.
+  _tooltip(d) {
+    const r = this._regById[d.properties?.id];
+    if (!r) return d.properties?.name ?? '';
+    const pop = (r.population ?? 0) >= 1000
+      ? `${((r.population) / 1000).toFixed(1)}B`
+      : `${r.population ?? 0}M`;
+    return `
+      <div style="font:12px system-ui;color:#d4d4e8;
+                  background:rgba(10,10,20,0.92);
+                  padding:6px 10px;border-radius:4px;
+                  border:1px solid #2e2e42;white-space:nowrap">
+        <b>${r.name ?? r.id}</b><br>
+        Pop: ${pop} · Unrest: ${r.unrest ?? 0}%${r.prosperity != null ? ` · Pros: ${r.prosperity}%` : ''}
+      </div>`;
+  }
 
-  _hitTest(sx, sy) {
-    const { W, H } = this._logSize();
-    const cx = W / 2, cy = H / 2;
-    const R  = this._globeR(W, H);
-
-    // Normalised coordinates relative to globe centre
-    const p = (sx - cx) / R;
-    const q = -(sy - cy) / R;
-    if (p * p + q * q > 1) return null; // outside globe disc
-
-    // Inverse orthographic → lon/lat
-    const toDeg = 180 / Math.PI;
-    const lat0  = this._panY * (Math.PI / 180);
-    const ρ     = Math.sqrt(p * p + q * q);
-
-    let lon, lat;
-    if (ρ < 1e-9) {
-      lat = this._panY;
-      lon = this._panX;
-    } else {
-      const c = Math.asin(Math.min(ρ, 1));
-      lat = Math.asin(Math.cos(c) * Math.sin(lat0) + q * Math.sin(c) * Math.cos(lat0) / ρ) * toDeg;
-      lon = this._panX + Math.atan2(
-        p * Math.sin(c),
-        ρ * Math.cos(c) * Math.cos(lat0) - q * Math.sin(c) * Math.sin(lat0),
-      ) * toDeg;
+  _updateBadges() {
+    const counts = {};
+    for (const a of (this._world?.armies ?? [])) {
+      counts[a.region_id] ??= { armies: 0, heroes: 0 };
+      counts[a.region_id].armies++;
     }
-    lon = ((lon + 180) % 360 + 360) % 360 - 180;
-
-    for (const { key, poly } of this._allGeo) {
-      if (pointInPolyLonLat(lon, lat, poly)) return this._byKey[key] ?? null;
+    for (const h of (this._world?.heroes ?? [])) {
+      counts[h.region_id] ??= { armies: 0, heroes: 0 };
+      counts[h.region_id].heroes++;
     }
-    return null;
+    const badges = Object.entries(counts).flatMap(([id, c]) => {
+      const r = this._regById[id];
+      return r?.lat != null ? [{ lat: r.lat, lng: r.lon, ...c }] : [];
+    });
+    this._globe.htmlElementsData(badges);
   }
-
-  // ── Mouse input ───────────────────────────────────────────────────────────
-
-  _onClick(e) {
-    if (this._drag?.moved) return;
-    const { x, y } = this._canvasPos(e);
-    const hit = this._hitTest(x, y);
-    if (hit) {
-      this._selected = hit.region.id;
-      this.onSelect(hit.region);
-    } else {
-      this._selected = null;
-      this.onSelect(null);
-    }
-    this._draw();
-  }
-
-  _onMouseDown(e) {
-    const { x, y } = this._canvasPos(e);
-    this._drag = { startX: x, startY: y, panX0: this._panX, panY0: this._panY, moved: false };
-    this.canvas.style.cursor = 'grabbing';
-  }
-
-  _onMouseMove(e) {
-    const { x, y } = this._canvasPos(e);
-    if (this._drag) {
-      const dx = x - this._drag.startX;
-      const dy = y - this._drag.startY;
-      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) this._drag.moved = true;
-      const { W, H } = this._logSize();
-      const dpp = 180 / (Math.PI * this._globeR(W, H)); // degrees per pixel
-      this._panX = this._drag.panX0 - dx * dpp;
-      this._panY = this._drag.panY0 - dy * dpp;
-      this._clampPanY();
-      this._draw();
-      return;
-    }
-    this._onHover(e);
-  }
-
-  _onMouseUp() {
-    const wasDragging = this._drag?.moved;
-    this._drag = null;
-    if (!wasDragging) {
-      this.canvas.style.cursor = this._hovered ? 'pointer' : 'default';
-    } else {
-      this.canvas.style.cursor = 'default';
-      this._normalisePanX();  // prevent float drift after long drag
-    }
-  }
-
-  _onHover(e) {
-    const { x, y } = this._canvasPos(e);
-    const hit = this._hitTest(x, y);
-    const id  = hit?.region.id ?? null;
-    if (id !== this._hovered) {
-      this._hovered = id;
-      this.canvas.style.cursor = id ? 'pointer' : 'default';
-      this._draw();
-    }
-  }
-
-  _onWheel(e) {
-    e.preventDefault();
-    this._applyZoom(e.deltaY < 0 ? 1.15 : 1 / 1.15);
-  }
-
-  // ── Keyboard input (§5.4) ─────────────────────────────────────────────────
-
-  _onKey(e) {
-    // Only respond when no input/textarea is focused
-    const tag = document.activeElement?.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-    if (e.key === '+' || e.key === '=') this._applyZoom(1.15);
-    if (e.key === '-')                   this._applyZoom(1 / 1.15);
-  }
-
-  _applyZoom(factor) {
-    this._zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, this._zoom * factor));
-    this._draw();
-  }
-
-  // ── Touch input (§12) ─────────────────────────────────────────────────────
-
-  _onTouchStart(e) {
-    e.preventDefault();
-    if (e.touches.length === 1) {
-      const pos = this._touchPos(e.touches[0]);
-      this._drag  = { startX: pos.x, startY: pos.y, panX0: this._panX, panY0: this._panY, moved: false };
-      this._pinch = null;
-    } else if (e.touches.length === 2) {
-      this._drag  = null;
-      this._pinch = {
-        dist0: this._touchDist(e.touches[0], e.touches[1]),
-        zoom0: this._zoom,
-        panX0: this._panX,
-        panY0: this._panY,
-        midX:  (this._touchPos(e.touches[0]).x + this._touchPos(e.touches[1]).x) / 2,
-        midY:  (this._touchPos(e.touches[0]).y + this._touchPos(e.touches[1]).y) / 2,
-      };
-    }
-  }
-
-  _onTouchMove(e) {
-    e.preventDefault();
-    if (e.touches.length === 1 && this._drag) {
-      const pos = this._touchPos(e.touches[0]);
-      const dx  = pos.x - this._drag.startX;
-      const dy  = pos.y - this._drag.startY;
-      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) this._drag.moved = true;
-      const { W, H } = this._logSize();
-      const dpp = 180 / (Math.PI * this._globeR(W, H));
-      this._panX = this._drag.panX0 - dx * dpp;
-      this._panY = this._drag.panY0 - dy * dpp;
-      this._clampPanY();
-      this._draw();
-    } else if (e.touches.length === 2 && this._pinch) {
-      const dist = this._touchDist(e.touches[0], e.touches[1]);
-      this._zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, this._pinch.zoom0 * dist / this._pinch.dist0));
-      this._draw();
-    }
-  }
-
-  _onTouchEnd(e) {
-    e.preventDefault();
-    if (e.touches.length === 0) {
-      // Tap to select
-      if (this._drag && !this._drag.moved) {
-        const hit = this._hitTest(this._drag.startX, this._drag.startY);
-        if (hit) {
-          this._selected = hit.region.id;
-          this.onSelect(hit.region);
-        } else {
-          this._selected = null;
-          this.onSelect(null);
-        }
-      }
-      if (this._drag?.moved) this._normalisePanX();
-      this._drag  = null;
-      this._pinch = null;
-      this._draw();
-    }
-  }
-
-  _touchPos(touch) {
-    const r = this.canvas.getBoundingClientRect();
-    return { x: touch.clientX - r.left, y: touch.clientY - r.top };
-  }
-
-  _touchDist(t1, t2) {
-    const dx = t1.clientX - t2.clientX;
-    const dy = t1.clientY - t2.clientY;
-    return Math.sqrt(dx * dx + dy * dy);
-  }
-
-  // ── Utilities ─────────────────────────────────────────────────────────────
-
-  _factionColorMap() {
-    const map = {};
-    for (const f of (this._world?.factions ?? [])) {
-      map[f.id] = FACTION_COLORS[f.type] ?? '#7c5cbf';
-    }
-    return map;
-  }
-
-  _indexBy(arr, key) {
-    return arr.reduce((acc, item) => {
-      const k = item[key];
-      if (k) (acc[k] = acc[k] ?? []).push(item);
-      return acc;
-    }, {});
-  }
-
-  _canvasPos(e) {
-    const r = this.canvas.getBoundingClientRect();
-    return { x: e.clientX - r.left, y: e.clientY - r.top };
-  }
-}
-
-function _roundRect(ctx, x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y);
-  ctx.arcTo(x + w, y, x + w, y + r, r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
-  ctx.lineTo(x + r, y + h);
-  ctx.arcTo(x, y + h, x, y + h - r, r);
-  ctx.lineTo(x, y + r);
-  ctx.arcTo(x, y, x + r, y, r);
-  ctx.closePath();
 }

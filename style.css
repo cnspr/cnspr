@@ -249,8 +249,7 @@ nav {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  display: block;
-  cursor: default;
+  overflow: hidden;
 }
 
 /* ── Map selection overlay (left orders + right info side panels) ─────── */
