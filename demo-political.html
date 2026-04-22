@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>POLITICAL MAP // GLOBE</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --ocean:        #080e1a;
+      --bg:           #060c18;
+      --panel-bg:     rgba(5, 10, 20, 0.93);
+      --panel-border: #152235;
+      --accent:       #3af0a0;
+      --accent2:      #f0a03a;
+      --text:         #a8c8e0;
+      --muted:        #38506a;
+      --font:         'Courier New', 'Lucida Console', monospace;
+    }
+
+    html, body { width: 100%; height: 100%; background: var(--bg); color: var(--text); font-family: var(--font); overflow: hidden; }
+
+    /* CRT scanline overlay */
+    body::after {
+      content: '';
+      position: fixed; inset: 0;
+      background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.05) 2px, rgba(0,0,0,0.05) 4px);
+      pointer-events: none; z-index: 200;
+    }
+
+    #globe-container { position: absolute; inset: 0; }
+
+    /* ── Loader ── */
+    #loader {
+      position: fixed; inset: 0;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      z-index: 300; background: var(--bg);
+      transition: opacity 0.5s;
+    }
+
+    .spinner {
+      width: 44px; height: 44px;
+      border: 1px solid var(--panel-border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #loader-label {
+      margin-top: 18px; font-size: 10px; letter-spacing: 0.2em;
+      text-transform: uppercase; color: var(--muted);
+    }
+
+    #loader-detail {
+      margin-top: 6px; font-size: 9px; letter-spacing: 0.12em;
+      color: var(--accent); min-height: 14px;
+    }
+
+    /* ── Info panel ── */
+    #info-panel {
+      position: fixed; top: 20px; left: 20px; width: 272px;
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-border);
+      border-left: 2px solid var(--accent);
+      backdrop-filter: blur(10px);
+      z-index: 100;
+      opacity: 0; transform: translateX(-8px);
+      transition: opacity 0.18s ease, transform 0.18s ease;
+      pointer-events: none;
+    }
+
+    #info-panel.visible { opacity: 1; transform: translateX(0); pointer-events: auto; }
+
+    .ip-header {
+      padding: 11px 14px 9px;
+      border-bottom: 1px solid var(--panel-border);
+      display: flex; align-items: center; gap: 9px;
+    }
+
+    .ip-flag { font-size: 22px; line-height: 1; flex-shrink: 0; }
+
+    .ip-name {
+      font-size: 11px; font-weight: bold; color: #d8ecff;
+      letter-spacing: 0.07em; text-transform: uppercase;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+
+    .ip-body { padding: 9px 14px 11px; }
+
+    .ip-row {
+      display: flex; justify-content: space-between; align-items: baseline;
+      padding: 4px 0; border-bottom: 1px solid rgba(21,34,53,0.6);
+    }
+    .ip-row:last-child { border-bottom: none; }
+
+    .ip-key { font-size: 8px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
+    .ip-val { font-size: 11px; color: var(--text); text-align: right; max-width: 160px; }
+    .ip-val.amber { color: var(--accent2); }
+    .ip-val.green { color: var(--accent); }
+
+    .ip-dot {
+      display: inline-block; width: 7px; height: 7px;
+      border-radius: 50%; margin-right: 5px; vertical-align: middle;
+    }
+
+    /* ── Title block ── */
+    #title {
+      position: fixed; top: 20px; right: 20px;
+      text-align: right; z-index: 100; pointer-events: none;
+    }
+
+    .title-main {
+      font-size: 16px; letter-spacing: 0.35em; color: #cce4ff;
+      text-transform: uppercase;
+      text-shadow: 0 0 28px rgba(58,240,160,0.18);
+    }
+
+    .title-sub {
+      font-size: 8px; letter-spacing: 0.22em; color: var(--muted);
+      text-transform: uppercase; margin-top: 3px;
+    }
+
+    /* ── Legend ── */
+    #legend {
+      position: fixed; bottom: 34px; right: 16px;
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-border);
+      padding: 10px 14px;
+      backdrop-filter: blur(8px);
+      z-index: 100;
+    }
+
+    .leg-title { font-size: 8px; letter-spacing: 0.17em; text-transform: uppercase; color: var(--muted); margin-bottom: 7px; }
+
+    .leg-item { display: flex; align-items: center; gap: 7px; padding: 2px 0; font-size: 9px; color: var(--text); letter-spacing: 0.05em; }
+
+    .leg-swatch { width: 11px; height: 11px; flex-shrink: 0; }
+
+    /* ── Status bar ── */
+    #status {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      padding: 5px 16px;
+      background: rgba(3, 6, 14, 0.88);
+      border-top: 1px solid var(--panel-border);
+      display: flex; align-items: center; gap: 18px;
+      font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase;
+      color: var(--muted); z-index: 100;
+    }
+
+    .s-live { display: flex; align-items: center; gap: 5px; }
+    .s-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 5px var(--accent); animation: pulse 2s ease-in-out infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+    #s-hovered { margin-left: auto; color: var(--text); }
+  </style>
+</head>
+<body>
+
+  <!-- Loader -->
+  <div id="loader">
+    <div class="spinner"></div>
+    <div id="loader-label">Initializing globe</div>
+    <div id="loader-detail">Fetching geographic data…</div>
+  </div>
+
+  <!-- Globe mount point -->
+  <div id="globe-container"></div>
+
+  <!-- Info panel -->
+  <div id="info-panel">
+    <div class="ip-header">
+      <span class="ip-flag" id="ip-flag"></span>
+      <span class="ip-name" id="ip-name"></span>
+    </div>
+    <div class="ip-body">
+      <div class="ip-row">
+        <span class="ip-key">Continent</span>
+        <span class="ip-val" id="ip-continent"></span>
+      </div>
+      <div class="ip-row">
+        <span class="ip-key">Population</span>
+        <span class="ip-val amber" id="ip-pop"></span>
+      </div>
+      <div class="ip-row">
+        <span class="ip-key">Full name</span>
+        <span class="ip-val" id="ip-long" style="font-size:9px;word-break:break-word"></span>
+      </div>
+      <div class="ip-row">
+        <span class="ip-key">Sovereignty</span>
+        <span class="ip-val green" id="ip-sov" style="font-size:10px"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Title -->
+  <div id="title">
+    <div class="title-main">Political</div>
+    <div class="title-sub">Natural Earth · 1:110m</div>
+  </div>
+
+  <!-- Legend -->
+  <div id="legend">
+    <div class="leg-title">Continent</div>
+    <div id="leg-items"></div>
+  </div>
+
+  <!-- Status bar -->
+  <div id="status">
+    <div class="s-live">
+      <div class="s-dot"></div>
+      <span id="s-count">—</span>
+    </div>
+    <span>Source: Natural Earth</span>
+    <span id="s-hovered">—</span>
+  </div>
+
+  <script src="/libs/globe.gl/globe.gl.min.js"></script>
+  <script>
+    'use strict';
+
+    // ── Palette ────────────────────────────────────────────────────────────────
+    const PALETTE = {
+      'Africa':                    { fill: '#a8661e', bright: '#d4883c' },
+      'Asia':                      { fill: '#1e6e80', bright: '#2ea0ba' },
+      'Europe':                    { fill: '#2e4e8a', bright: '#5080c8' },
+      'North America':             { fill: '#7a2e52', bright: '#b05080' },
+      'South America':             { fill: '#1e6a3e', bright: '#38a060' },
+      'Oceania':                   { fill: '#5a2e80', bright: '#8858c0' },
+      'Antarctica':                { fill: '#2e3e4e', bright: '#4a5e6e' },
+      'Seven seas (open ocean)':   { fill: '#101e2e', bright: '#1e3048' },
+    };
+    const DEFAULT_PAL = { fill: '#243040', bright: '#3a5060' };
+
+    function pal(continent) { return PALETTE[continent] ?? DEFAULT_PAL; }
+
+    // Lighten a hex color by `amt` (0-255 per channel)
+    function lighten(hex, amt) {
+      const r = Math.min(255, parseInt(hex.slice(1,3),16) + amt);
+      const g = Math.min(255, parseInt(hex.slice(3,5),16) + amt);
+      const b = Math.min(255, parseInt(hex.slice(5,7),16) + amt);
+      return `rgba(${r},${g},${b},0.92)`;
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────────
+    function fmtPop(n) {
+      if (!n || n <= 0) return '—';
+      if (n >= 1e9) return (n / 1e9).toFixed(2) + ' B';
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + ' M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + ' K';
+      return String(n);
+    }
+
+    function flagEmoji(iso2) {
+      if (!iso2 || iso2 === '-99' || iso2.length !== 2) return '';
+      try {
+        return [...iso2.toUpperCase()]
+          .map(c => String.fromCodePoint(c.charCodeAt(0) - 65 + 0x1F1E6))
+          .join('');
+      } catch { return ''; }
+    }
+
+    function centroid(geometry) {
+      const rings = geometry.type === 'Polygon'
+        ? [geometry.coordinates[0]]
+        : geometry.coordinates.map(p => p[0]);
+      let lngs = [], lats = [];
+      rings.forEach(ring => ring.forEach(([ln, lt]) => { lngs.push(ln); lats.push(lt); }));
+      return {
+        lat: (Math.min(...lats) + Math.max(...lats)) / 2,
+        lng: (Math.min(...lngs) + Math.max(...lngs)) / 2,
+      };
+    }
+
+    function makeOcean() {
+      const c = document.createElement('canvas');
+      c.width = 2; c.height = 2;
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = '#080e1a';
+      ctx.fillRect(0, 0, 2, 2);
+      return c.toDataURL();
+    }
+
+    // ── Globe state ────────────────────────────────────────────────────────────
+    let globe;
+    let hoverId   = null;
+    let selectId  = null;
+
+    function capColor(d) {
+      const p   = d.properties;
+      const id  = p.ADM0_A3;
+      const col = pal(p.CONTINENT);
+      if (id === selectId) return lighten(col.fill, 65);
+      if (id === hoverId)  return lighten(col.fill, 32);
+      return col.fill + 'bb';
+    }
+
+    function strokeColor(d) {
+      const id = d.properties.ADM0_A3;
+      if (id === selectId) return '#ffffff';
+      if (id === hoverId)  return pal(d.properties.CONTINENT).bright;
+      return '#0a1828';
+    }
+
+    function altitude(d) {
+      const id = d.properties.ADM0_A3;
+      if (id === selectId) return 0.02;
+      if (id === hoverId)  return 0.01;
+      return 0.001;
+    }
+
+    function refresh() {
+      globe
+        .polygonCapColor(capColor)
+        .polygonStrokeColor(strokeColor)
+        .polygonAltitude(altitude);
+    }
+
+    // ── Tooltip ────────────────────────────────────────────────────────────────
+    function tooltip(d) {
+      const p = d.properties;
+      const c = pal(p.CONTINENT);
+      return `
+        <div style="font-family:'Courier New',monospace;font-size:11px;
+                    background:rgba(3,6,14,0.96);border:1px solid #152235;
+                    border-left:2px solid ${c.bright};padding:8px 12px;
+                    color:#a8c8e0;white-space:nowrap;letter-spacing:0.05em">
+          <div style="font-size:13px;color:#d8ecff;font-weight:bold;margin-bottom:4px">
+            ${flagEmoji(p.ISO_A2)}&nbsp;${p.NAME ?? p.ADMIN}
+          </div>
+          <div style="color:#38506a;font-size:9px;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:4px">
+            ${p.CONTINENT}
+          </div>
+          <div style="color:#f0a03a">${fmtPop(p.POP_EST)}</div>
+        </div>`;
+    }
+
+    // ── Info panel ────────────────────────────────────────────────────────────
+    function showPanel(p) {
+      const c = pal(p.CONTINENT);
+      document.getElementById('ip-flag').textContent      = flagEmoji(p.ISO_A2);
+      document.getElementById('ip-name').textContent      = p.NAME ?? p.ADMIN ?? '—';
+      document.getElementById('ip-continent').innerHTML   =
+        `<span class="ip-dot" style="background:${c.bright}"></span>${p.CONTINENT ?? '—'}`;
+      document.getElementById('ip-pop').textContent       = fmtPop(p.POP_EST);
+      document.getElementById('ip-long').textContent      = p.NAME_LONG ?? p.ADMIN ?? '—';
+      document.getElementById('ip-sov').textContent       = p.SOVEREIGNT ?? '—';
+      document.getElementById('info-panel').classList.add('visible');
+    }
+
+    function hidePanel() {
+      document.getElementById('info-panel').classList.remove('visible');
+    }
+
+    // ── Legend ─────────────────────────────────────────────────────────────────
+    function buildLegend() {
+      const wrap = document.getElementById('leg-items');
+      for (const [name, c] of Object.entries(PALETTE)) {
+        if (name.includes('seas')) continue;
+        const row = document.createElement('div');
+        row.className = 'leg-item';
+        row.innerHTML = `<div class="leg-swatch" style="background:${c.fill};border:1px solid ${c.bright}"></div><span>${name}</span>`;
+        wrap.appendChild(row);
+      }
+    }
+
+    // ── Main ───────────────────────────────────────────────────────────────────
+    async function init() {
+      buildLegend();
+
+      const detail = document.getElementById('loader-detail');
+
+      // Fetch
+      detail.textContent = 'Fetching ne_110m_admin_0_countries.geojson…';
+      let features;
+      try {
+        const res = await fetch(
+          'https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_110m_admin_0_countries.geojson'
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        detail.textContent = 'Parsing features…';
+        const json = await res.json();
+        features = json.features;
+      } catch (err) {
+        detail.style.color = '#e74c3c';
+        detail.textContent = 'Error: ' + err.message;
+        return;
+      }
+
+      document.getElementById('s-count').textContent = `${features.length} territories loaded`;
+
+      // Build globe
+      detail.textContent = 'Rendering…';
+      const container = document.getElementById('globe-container');
+
+      globe = Globe({ animateIn: true })(container);
+      globe
+        .width(window.innerWidth)
+        .height(window.innerHeight)
+        .backgroundColor('rgba(0,0,0,0)')
+        .globeImageUrl(makeOcean())
+        .showAtmosphere(true)
+        .atmosphereColor('#08204a')
+        .atmosphereAltitude(0.14)
+        .polygonsData(features)
+        .polygonCapColor(capColor)
+        .polygonSideColor(d => pal(d.properties.CONTINENT).fill + '44')
+        .polygonStrokeColor(strokeColor)
+        .polygonAltitude(altitude)
+        .polygonLabel(tooltip)
+        .onPolygonHover(poly => {
+          const id = poly?.properties?.ADM0_A3 ?? null;
+          if (id === hoverId) return;
+          hoverId = id;
+          document.getElementById('s-hovered').textContent = poly
+            ? `${flagEmoji(poly.properties.ISO_A2)} ${poly.properties.NAME}`
+            : '—';
+          refresh();
+        })
+        .onPolygonClick(poly => {
+          if (!poly) return;
+          selectId = poly.properties.ADM0_A3;
+          showPanel(poly.properties);
+          const { lat, lng } = centroid(poly.geometry);
+          globe.pointOfView({ lat, lng, altitude: 1.8 }, 900);
+          refresh();
+        })
+        .onGlobeClick(() => {
+          selectId = null;
+          hidePanel();
+          refresh();
+        });
+
+      window.addEventListener('resize', () =>
+        globe.width(window.innerWidth).height(window.innerHeight)
+      );
+
+      // Fade out loader
+      const loader = document.getElementById('loader');
+      loader.style.opacity = '0';
+      setTimeout(() => loader.remove(), 520);
+    }
+
+    init();
+  </script>
+</body>
+</html>

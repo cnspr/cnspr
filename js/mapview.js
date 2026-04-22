@@ -30,6 +30,19 @@ const FACTION_COLORS = {
   conspiracy: _css('--faction-conspiracy') || '#9b59b6',
 };
 
+// Natural Earth continent fill colors (shown as background in political view)
+const CONTINENT_FILL = {
+  'Africa':                  '#7a4e18',
+  'Asia':                    '#185868',
+  'Europe':                  '#1e3870',
+  'North America':           '#5e1e3e',
+  'South America':           '#145830',
+  'Oceania':                 '#3e1e68',
+  'Antarctica':              '#1e2e3e',
+  'Seven seas (open ocean)': '#060e1a',
+};
+const CONTINENT_FILL_DEF = '#101e2e';
+
 // ── Region ID key helper ────────────────────────────────────────────────────
 const _toKey = id => id.replace(/^reg_/, '');
 
@@ -296,17 +309,18 @@ export class MapView {
   constructor(container, onSelect) {
     this._container     = container;
     this.onSelect       = onSelect;
-    this._world         = null;
-    this._seeds         = null;
-    this._geoKeys       = null;
-    this._geoCells      = null;
-    this._adjacency     = null;
-    this._features      = [];
-    this._regById       = {};
-    this._factionColors = {};
-    this._selected      = null;
-    this._hovered       = null;
-    this._view          = 'political';
+    this._world           = null;
+    this._seeds           = null;
+    this._geoKeys         = null;
+    this._geoCells        = null;
+    this._adjacency       = null;
+    this._features        = [];
+    this._countryFeatures = null;   // null = not yet fetched; [] = fetched (possibly empty)
+    this._regById         = {};
+    this._factionColors   = {};
+    this._selected        = null;
+    this._hovered         = null;
+    this._view            = 'political';
 
     const G = window.Globe;
     if (!G) throw new Error('globe.gl not loaded (window.Globe is undefined)');
@@ -328,12 +342,21 @@ export class MapView {
       // Polygons
       .polygonsData([])
       .polygonCapColor(d => this._capColor(d))
-      .polygonSideColor(() => 'rgba(0,0,0,0.3)')
+      .polygonSideColor(d => d.properties?._isCountry ? 'rgba(0,0,0,0)' : 'rgba(0,0,0,0.3)')
       .polygonStrokeColor(d => this._strokeColor(d))
-      .polygonAltitude(d => d.properties?.id === this._selected ? 0.012 : 0.001)
+      .polygonAltitude(d => this._altOf(d))
       .polygonLabel(d => this._tooltip(d))
       .onPolygonClick(polygon => {
         if (!polygon) return;
+        if (polygon.properties._isCountry) {
+          // Click on country background → deselect game region
+          if (this._selected !== null) {
+            this._selected = null;
+            this._refresh();
+            this.onSelect(null);
+          }
+          return;
+        }
         const region = this._regById[polygon.properties.id];
         if (region) {
           this._selected = region.id;
@@ -342,6 +365,10 @@ export class MapView {
         }
       })
       .onPolygonHover(polygon => {
+        if (polygon?.properties?._isCountry) {
+          if (this._hovered !== null) { this._hovered = null; this._refresh(); }
+          return;
+        }
         const id = polygon?.properties?.id ?? null;
         if (id !== this._hovered) {
           this._hovered = id;
@@ -437,6 +464,9 @@ export class MapView {
           return { lat: r.lat, lng: r.lon, name: r.name };
         }),
       );
+
+      // Kick off background fetch of real-world country polygons
+      this._loadCountries();
     }
 
     // Sync current game-state into feature properties
@@ -449,7 +479,7 @@ export class MapView {
         f.properties.prosperity        = r.prosperity  ?? 0;
       }
     }
-    this._globe.polygonsData(this._features);
+    this._rebuildPolygons();
     this._updateBadges();
   }
 
@@ -486,11 +516,19 @@ export class MapView {
     this._globe
       .polygonCapColor(d => this._capColor(d))
       .polygonStrokeColor(d => this._strokeColor(d))
-      .polygonAltitude(d => d.properties?.id === this._selected ? 0.012 : 0.001);
+      .polygonAltitude(d => this._altOf(d));
   }
 
   _capColor(d) {
-    const p     = d.properties;
+    const p = d.properties;
+
+    // Country background layer — visible only in political view
+    if (p._isCountry) {
+      if (this._view !== 'political') return 'rgba(0,0,0,0)';
+      const fill = CONTINENT_FILL[p.CONTINENT] ?? CONTINENT_FILL_DEF;
+      return fill + 'cc'; // ~80% opacity
+    }
+
     const isSel = p.id === this._selected;
     const isHov = p.id === this._hovered;
     const alpha = isSel || isHov ? 0.95 : 0.72;
@@ -522,6 +560,9 @@ export class MapView {
   }
 
   _strokeColor(d) {
+    if (d.properties?._isCountry) {
+      return this._view === 'political' ? '#0a1828' : 'rgba(0,0,0,0)';
+    }
     const id = d.properties?.id;
     if (id === this._selected) return COL_BORDER_SEL;
     if (id === this._hovered)  return COL_BORDER_HOV;
@@ -529,6 +570,7 @@ export class MapView {
   }
 
   _tooltip(d) {
+    if (d.properties?._isCountry) return '';
     const r = this._regById[d.properties?.id];
     if (!r) return d.properties?.name ?? '';
     const pop = (r.population ?? 0) >= 1000
@@ -542,6 +584,41 @@ export class MapView {
         <b>${r.name ?? r.id}</b><br>
         Pop: ${pop} · Unrest: ${r.unrest ?? 0}%${r.prosperity != null ? ` · Pros: ${r.prosperity}%` : ''}
       </div>`;
+  }
+
+  _altOf(d) {
+    if (d.properties?._isCountry) return 0;
+    const id = d.properties?.id;
+    if (id === this._selected) return 0.012;
+    return 0.001;
+  }
+
+  /** Fetch Natural Earth 110m country polygons once, then re-render. */
+  async _loadCountries() {
+    if (this._countryFeatures !== null) return;
+    this._countryFeatures = []; // mark in-progress
+    try {
+      const res  = await fetch(
+        'https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_110m_admin_0_countries.geojson'
+      );
+      const json = await res.json();
+      this._countryFeatures = json.features.map(f => ({
+        ...f,
+        properties: { ...f.properties, _isCountry: true },
+      }));
+    } catch (e) {
+      console.warn('MapView: failed to load country GeoJSON', e);
+      this._countryFeatures = [];
+    }
+    this._rebuildPolygons();
+  }
+
+  /** Combine country background + game region features into one polygonsData call. */
+  _rebuildPolygons() {
+    this._globe.polygonsData([
+      ...(this._countryFeatures ?? []),
+      ...this._features,
+    ]);
   }
 
   _updateBadges() {
