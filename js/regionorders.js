@@ -17,16 +17,6 @@ const MISSION_TYPES = [
 
 const REGION_ACTIONS = [
   {
-    label:  'Fund Propaganda',
-    type:   'set_propaganda',
-    // target the dominant faction (highest influence share)
-    params: r => {
-      const inf = r.faction_influence ?? {};
-      const dom = Object.entries(inf).sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
-      return { faction_id: dom, value: 5 };
-    },
-  },
-  {
     label:  'Levy Tax',
     type:   'levy_tax',
     params: r => ({ region_id: r.id, amount: 10 }),
@@ -59,6 +49,94 @@ export class RegionOrdersPanel {
     this._expandedId = null;
     this._staged     = 0;
     this._render();
+  }
+
+  showCountry(info, world) {
+    this._region     = null;
+    this._world      = world;
+    this._expandedId = null;
+    this._staged     = 0;
+
+    const { country, archetype, regions, factionInfluence } = info;
+    const factionMap = {};
+    for (const f of (world?.factions ?? [])) factionMap[f.id] = f;
+
+    const stagedBadge = this._staged > 0
+      ? `<span class="wi-staged-badge">${this._staged} staged</span>`
+      : '';
+
+    // Show all factions with their country-wide influence totals
+    const factionEntries = Object.entries(factionInfluence ?? {}).sort((a, b) => b[1] - a[1]);
+    const factionsHtml = factionEntries.length
+      ? factionEntries.map(([fid, total]) => {
+          const f   = factionMap[fid];
+          const avg = regions.length ? (total / regions.length * 100).toFixed(0) : '0';
+          return `<div class="wo-faction-row">
+            <span class="wo-faction-name">${f?.name ?? fid}</span>
+            <span class="wo-faction-type wi-muted">${f?.type ?? ''}</span>
+            <span class="wo-faction-inf">${avg}%</span>
+            <button class="wo-action-btn" data-faction-id="${fid}" data-action="propaganda">
+              Fund Propaganda
+            </button>
+          </div>`;
+        }).join('')
+      : `<div class="wo-empty">No factions active in ${country}.</div>`;
+
+    // First region of this country used as target for country-wide actions
+    const anyRegionId = regions[0]?.id ?? '';
+
+    this.el.innerHTML = `
+      <div class="wi-header">
+        <span class="wi-title">Gov't Orders — ${country}</span>
+        ${stagedBadge}
+      </div>
+
+      <div class="wi-section-title">Active Factions</div>
+      <div id="wo-factions">${factionsHtml}</div>
+
+      <div class="wi-section-title">Country Actions</div>
+      <div class="wo-action-grid">
+        <button class="wo-action-btn" data-country-action="levy" data-region-id="${anyRegionId}">Levy Tax</button>
+        <button class="wo-action-btn" data-country-action="agent" data-region-id="${anyRegionId}">Dispatch Agent</button>
+        <button class="wo-action-btn" data-country-action="build" data-region-id="${anyRegionId}">Sponsor Build</button>
+      </div>
+    `;
+
+    // Propaganda per faction
+    this.el.querySelectorAll('[data-action="propaganda"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const fid = btn.dataset.factionId;
+        this._addOrder('set_propaganda', { faction_id: fid, value: 5 });
+        this._staged++;
+        this._renderStagedBadge();
+      });
+    });
+
+    // Country-level actions (target first region as anchor)
+    this.el.querySelectorAll('[data-country-action]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const rid = btn.dataset.regionId;
+        switch (btn.dataset.countryAction) {
+          case 'levy':  this._addOrder('levy_tax',     { region_id: rid, amount: 10 }); break;
+          case 'agent': this._addOrder('recruit_hero', { name: '', role: 'agent', region_id: rid }); break;
+          case 'build': this._addOrder('build',        { region_id: rid, structure: 'fort' }); break;
+        }
+        this._staged++;
+        this._renderStagedBadge();
+      });
+    });
+  }
+
+  _renderStagedBadge() {
+    const header = this.el.querySelector('.wi-header');
+    if (!header) return;
+    let badge = header.querySelector('.wi-staged-badge');
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'wi-staged-badge';
+      header.appendChild(badge);
+    }
+    badge.textContent = `${this._staged} staged`;
   }
 
   hide() {

@@ -270,6 +270,7 @@ function initApp() {
   // Init panels
   mapView = new MapView(
     document.getElementById('map-canvas'),
+    // onSelect — fires for individual region clicks (non-political view)
     (region) => {
       if (region && world) {
         regionInfoPanel.show(region, world, mapView.getAdjacentIds(region.id));
@@ -280,9 +281,25 @@ function initApp() {
         mapSelectionEl.classList.remove('open');
       }
     },
+    // onCountrySelect — fires for game-country clicks (political view) OR Natural Earth background
     (countryProps) => {
-      if (countryProps) showCountryPanel(countryProps);
-      else hideCountryPanel();
+      if (!countryProps) {
+        hideCountryPanel();
+        regionOrdersPanel.hide();
+        mapSelectionEl.classList.remove('open');
+        return;
+      }
+      if (countryProps._isGameCountry) {
+        // Political view: show country info on right, government orders on left
+        if (world) {
+          regionInfoPanel.showCountry(countryProps, world);
+          regionOrdersPanel.showCountry(countryProps, world);
+          mapSelectionEl.classList.add('open');
+        }
+      } else {
+        // Natural Earth background country — existing info panel
+        showCountryPanel(countryProps);
+      }
     },
   );
 

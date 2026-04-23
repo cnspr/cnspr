@@ -334,15 +334,19 @@ export class MapView {
     this._geoKeys         = null;
     this._geoCells        = null;
     this._adjacency       = null;
-    this._features        = [];
-    this._countryFeatures = null;   // null = not yet fetched; [] = fetched (possibly empty)
-    this._regById         = {};
-    this._factionColors   = {};
-    this._selected        = null;
-    this._hovered         = null;
-    this._countryHovered  = null;
-    this._countrySelected = null;
-    this._view            = 'political';
+    this._features           = [];
+    this._countryFeatures    = null;   // null = not yet fetched; [] = in-progress/empty
+    this._countriesLoaded    = false;
+    this._pendingPolygonRebuild = false;
+    this._regById            = {};
+    this._factionColors      = {};
+    this._selected           = null;   // region id (non-political views)
+    this._hovered            = null;   // region id
+    this._countryHovered     = null;   // Natural Earth ADM0_A3
+    this._countrySelected    = null;   // Natural Earth ADM0_A3
+    this._gameCountry        = null;   // game country name (political view)
+    this._gameCountryHovered = null;   // game country name
+    this._view               = 'political';
 
     const G = window.Globe;
     if (!G) throw new Error('globe.gl not loaded (window.Globe is undefined)');
@@ -382,33 +386,55 @@ export class MapView {
           }
           return;
         }
-        // Game region clicked — clear country selection
+        // Game region clicked
         if (this._countrySelected !== null) {
           this._countrySelected = null;
-          if (this._onCountrySelect) this._onCountrySelect(null);
         }
         const region = this._regById[polygon.properties.id];
-        if (region) {
-          this._selected = region.id;
+        if (!region) return;
+
+        if (this._view === 'political') {
+          // Country-level selection: highlight all regions in the same country
+          const country = polygon.properties.country;
+          this._gameCountry = country ?? null;
+          this._selected    = null;
+          this._refresh();
+          if (this._onCountrySelect) {
+            this._onCountrySelect(country ? this._buildCountryInfo(country) : null);
+          }
+        } else {
+          // Region-level selection
+          this._gameCountry = null;
+          this._selected    = region.id;
           this._refresh();
           this.onSelect(region);
         }
       })
       .onPolygonHover(polygon => {
         if (polygon?.properties?._isCountry) {
-          const cid = polygon.properties.ADM0_A3;
-          const changed = cid !== this._countryHovered || this._hovered !== null;
-          this._countryHovered = cid;
-          this._hovered = null;
+          const cid     = polygon.properties.ADM0_A3;
+          const changed = cid !== this._countryHovered || this._hovered !== null || this._gameCountryHovered !== null;
+          this._countryHovered     = cid;
+          this._hovered            = null;
+          this._gameCountryHovered = null;
           if (changed) this._refresh();
           return;
         }
         const hadCountryHov = this._countryHovered !== null;
         this._countryHovered = null;
-        const id = polygon?.properties?.id ?? null;
-        if (id !== this._hovered || hadCountryHov) {
-          this._hovered = id;
-          this._refresh();
+
+        if (this._view === 'political') {
+          const gc      = polygon?.properties?.country ?? null;
+          const changed = gc !== this._gameCountryHovered || hadCountryHov || this._hovered !== null;
+          this._gameCountryHovered = gc;
+          this._hovered            = null;
+          if (changed) this._refresh();
+        } else {
+          const id      = polygon?.properties?.id ?? null;
+          const changed = id !== this._hovered || hadCountryHov || this._gameCountryHovered !== null;
+          this._gameCountryHovered = null;
+          this._hovered            = id;
+          if (changed) this._refresh();
         }
       })
       .onGlobeClick(() => {
@@ -420,6 +446,10 @@ export class MapView {
         }
         if (this._countrySelected !== null) {
           this._countrySelected = null;
+          changed = true;
+        }
+        if (this._gameCountry !== null) {
+          this._gameCountry = null;
           if (this._onCountrySelect) this._onCountrySelect(null);
           changed = true;
         }
@@ -465,6 +495,9 @@ export class MapView {
         .height(container.clientHeight);
     });
     this._ro.observe(container);
+
+    // Start fetching country polygons immediately so they're ready before first render
+    this._loadCountries();
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -496,7 +529,14 @@ export class MapView {
           return {
             type: 'Feature',
             geometry: { type: 'Polygon', coordinates: [coords] },
-            properties: { key, id: region.id, name: region.name },
+            // static fields set once; dynamic fields updated each render()
+            properties: {
+              key,
+              id:        region.id,
+              name:      region.name,
+              country:   region.country   ?? null,
+              archetype: region.archetype ?? null,
+            },
           };
         });
 
@@ -507,9 +547,6 @@ export class MapView {
           return { lat: r.lat, lng: r.lon, name: r.name };
         }),
       );
-
-      // Kick off background fetch of real-world country polygons
-      this._loadCountries();
     }
 
     // Sync current game-state into feature properties
@@ -522,7 +559,13 @@ export class MapView {
         f.properties.prosperity        = r.prosperity  ?? 0;
       }
     }
-    this._rebuildPolygons();
+
+    // Only render polygons once countries are ready — avoids the two-phase flicker
+    if (this._countriesLoaded) {
+      this._rebuildPolygons();
+    } else {
+      this._pendingPolygonRebuild = true;
+    }
     this._updateBadges();
   }
 
@@ -532,17 +575,19 @@ export class MapView {
   }
 
   deselect() {
-    this._selected = null;
+    this._selected    = null;
+    this._gameCountry = null;
     if (this._countrySelected !== null) {
       this._countrySelected = null;
-      if (this._onCountrySelect) this._onCountrySelect(null);
     }
+    if (this._onCountrySelect) this._onCountrySelect(null);
     this._refresh();
   }
 
   setView(mode) {
     if (!['political','population','unrest','prosperity'].includes(mode)) return;
-    if (this._view === 'political' && mode !== 'political' && this._countrySelected !== null) {
+    if (this._view === 'political' && mode !== 'political') {
+      this._gameCountry = null;
       this._countrySelected = null;
       if (this._onCountrySelect) this._onCountrySelect(null);
     }
@@ -583,9 +628,12 @@ export class MapView {
       return fill + 'cc';
     }
 
-    const isSel = p.id === this._selected;
-    const isHov = p.id === this._hovered;
-    const alpha = isSel || isHov ? 0.95 : 0.72;
+    const country     = p.country ?? null;
+    const isSelReg    = p.id === this._selected;
+    const isHovReg    = p.id === this._hovered;
+    const isSelCountry = country && country === this._gameCountry;
+    const isHovCountry = country && country === this._gameCountryHovered;
+    const alpha = isSelReg || isHovReg || isSelCountry || isHovCountry ? 0.95 : 0.72;
 
     switch (this._view) {
       case 'population': {
@@ -605,9 +653,8 @@ export class MapView {
           threeStopColor(p.prosperity ?? 0, 0, 50, 100, '#c0392b', '#e67e22', '#27ae60'),
           alpha,
         );
-      default: { // political
-        const fid  = dominantFaction({ faction_influence: p.faction_influence ?? {} });
-        const base = this._factionColors[fid] ?? COL_LAND_DEF;
+      default: { // political — colour by archetype; highlight selected country
+        const base = FACTION_COLORS[p.archetype] ?? COL_LAND_DEF;
         return _withAlpha(base, alpha);
       }
     }
@@ -621,7 +668,10 @@ export class MapView {
       if (p.ADM0_A3 === this._countryHovered)  return CONTINENT_PALETTE[p.CONTINENT]?.bright ?? '#4a6088';
       return '#0a1828';
     }
-    const id = d.properties?.id;
+    const id      = d.properties?.id;
+    const country = d.properties?.country ?? null;
+    if (country && country === this._gameCountry)        return COL_BORDER_SEL;
+    if (country && country === this._gameCountryHovered) return COL_BORDER_HOV;
     if (id === this._selected) return COL_BORDER_SEL;
     if (id === this._hovered)  return COL_BORDER_HOV;
     return COL_BORDER;
@@ -648,6 +698,22 @@ export class MapView {
     }
     const r = this._regById[d.properties?.id];
     if (!r) return d.properties?.name ?? '';
+
+    if (this._view === 'political' && r.country) {
+      const info = this._buildCountryInfo(r.country);
+      const archCol = FACTION_COLORS[info.archetype] ?? COL_LAND_DEF;
+      return `
+        <div style="font:12px system-ui;color:#d4d4e8;
+                    background:rgba(10,10,20,0.92);
+                    padding:6px 10px;border-radius:4px;
+                    border:1px solid #2e2e42;white-space:nowrap">
+          <b style="color:${archCol}">${info.country}</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:6px">${info.archetype ?? ''}</span><br>
+          ${info.regions.length} region${info.regions.length !== 1 ? 's' : ''}
+          · Pop: ${info.totalPop >= 1000 ? (info.totalPop/1000).toFixed(1)+'B' : info.totalPop+'M'}
+        </div>`;
+    }
+
     const pop = (r.population ?? 0) >= 1000
       ? `${((r.population) / 1000).toFixed(1)}B`
       : `${r.population ?? 0}M`;
@@ -665,12 +731,14 @@ export class MapView {
     if (d.properties?._isCountry) {
       return d.properties.ADM0_A3 === this._countrySelected ? 0.006 : 0;
     }
-    const id = d.properties?.id;
+    const id      = d.properties?.id;
+    const country = d.properties?.country ?? null;
+    if (country && country === this._gameCountry) return 0.010;
     if (id === this._selected) return 0.012;
     return 0.001;
   }
 
-  /** Fetch Natural Earth 110m country polygons once, then re-render. */
+  /** Fetch Natural Earth 110m country polygons once, then trigger first render. */
   async _loadCountries() {
     if (this._countryFeatures !== null) return;
     this._countryFeatures = []; // mark in-progress
@@ -687,7 +755,42 @@ export class MapView {
       console.warn('MapView: failed to load country GeoJSON', e);
       this._countryFeatures = [];
     }
-    this._rebuildPolygons();
+    this._countriesLoaded = true;
+    if (this._pendingPolygonRebuild) {
+      this._pendingPolygonRebuild = false;
+      this._rebuildPolygons();
+    }
+  }
+
+  /** Build aggregated country info object from all regions sharing the same country name. */
+  _buildCountryInfo(country) {
+    const regions   = this._features
+      .filter(f => f.properties.country === country)
+      .map(f => this._regById[f.properties.id])
+      .filter(Boolean);
+    const archetype = this._features.find(f => f.properties.country === country)?.properties.archetype ?? null;
+
+    let totalPop = 0, totalUnrest = 0, totalPros = 0;
+    const factionTotals = {};
+    for (const r of regions) {
+      totalPop   += r.population  ?? 0;
+      totalUnrest += r.unrest     ?? 0;
+      totalPros   += r.prosperity ?? 0;
+      for (const [fid, val] of Object.entries(r.faction_influence ?? {})) {
+        factionTotals[fid] = (factionTotals[fid] ?? 0) + val;
+      }
+    }
+    const n = regions.length || 1;
+    return {
+      _isGameCountry: true,
+      country,
+      archetype,
+      regions,
+      totalPop,
+      avgUnrest:   Math.round(totalUnrest / n),
+      avgProsperity: Math.round(totalPros / n),
+      factionInfluence: factionTotals,
+    };
   }
 
   /** Combine country background + game region features into one polygonsData call. */

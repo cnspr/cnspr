@@ -152,6 +152,58 @@ export class RegionInfoPanel {
     });
   }
 
+  showCountry(info, world) {
+    const { country, archetype, regions, totalPop, avgUnrest, avgProsperity, factionInfluence } = info;
+    const factionMap = {};
+    for (const f of (world?.factions ?? [])) factionMap[f.id] = f;
+
+    const archCol  = FACTION_COLORS[archetype] ?? '#7c5cbf';
+    const popStr   = totalPop >= 1000 ? `${(totalPop/1000).toFixed(1)}B` : `${totalPop}M`;
+
+    const regionListHtml = regions
+      .map(r => `<div class="wi-row">
+        <span class="wi-label">${r.name ?? r.id}</span>
+        <span class="wi-val wi-muted">${r.population ?? 0}M · ${r.unrest ?? 0}% unrest</span>
+      </div>`)
+      .join('');
+
+    const factionEntries = Object.entries(factionInfluence ?? {}).sort((a, b) => b[1] - a[1]);
+    const influenceHtml = factionEntries.length
+      ? factionEntries.map(([fid, total]) => {
+          const f   = factionMap[fid];
+          const col = FACTION_COLORS[f?.type] ?? '#7c5cbf';
+          const avg = regions.length ? (total / regions.length * 100).toFixed(0) : '0';
+          return `<div class="wi-row">
+            <span class="wi-label" style="color:${col}">${f?.name ?? fid}</span>
+            <span class="wi-val" style="color:${col}">${avg}% avg</span>
+          </div>`;
+        }).join('')
+      : '<span class="wi-muted">No faction presence recorded</span>';
+
+    this.el.innerHTML = `
+      <div class="wi-header">
+        <span class="wi-title" style="color:${archCol}">${country}</span>
+        <span class="wi-type-badge">${archetype ?? ''}</span>
+        <button class="wi-close" id="wi-close-btn" title="Dismiss">✕</button>
+      </div>
+
+      <div class="wi-section-title">Overview</div>
+      <div class="wi-row"><span class="wi-label">Population</span><span class="wi-val">${popStr}</span></div>
+      <div class="wi-row"><span class="wi-label">Avg Unrest</span><span class="wi-val" style="color:${unrestColor(avgUnrest)}">${avgUnrest}%</span></div>
+      <div class="wi-row"><span class="wi-label">Avg Prosperity</span><span class="wi-val">${avgProsperity}%</span></div>
+
+      <div class="wi-section-title">Regions (${regions.length})</div>
+      ${regionListHtml}
+
+      <div class="wi-section-title">Faction Presence</div>
+      ${influenceHtml}
+    `;
+
+    this.el.querySelector('#wi-close-btn').addEventListener('click', () => {
+      this.onDismiss?.();
+    });
+  }
+
   hide() {
     this.el.innerHTML = '';
   }
