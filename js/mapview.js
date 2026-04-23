@@ -30,18 +30,36 @@ const FACTION_COLORS = {
   conspiracy: _css('--faction-conspiracy') || '#9b59b6',
 };
 
-// Natural Earth continent fill colors (shown as background in political view)
-const CONTINENT_FILL = {
-  'Africa':                  '#7a4e18',
-  'Asia':                    '#185868',
-  'Europe':                  '#1e3870',
-  'North America':           '#5e1e3e',
-  'South America':           '#145830',
-  'Oceania':                 '#3e1e68',
-  'Antarctica':              '#1e2e3e',
-  'Seven seas (open ocean)': '#060e1a',
+// Natural Earth continent fill + highlight colors (shown as background in political view)
+export const CONTINENT_PALETTE = {
+  'Africa':                  { fill: '#7a4e18', bright: '#c07828' },
+  'Asia':                    { fill: '#185868', bright: '#2898b8' },
+  'Europe':                  { fill: '#1e3870', bright: '#3060c0' },
+  'North America':           { fill: '#5e1e3e', bright: '#9e3878' },
+  'South America':           { fill: '#145830', bright: '#209850' },
+  'Oceania':                 { fill: '#3e1e68', bright: '#7848b8' },
+  'Antarctica':              { fill: '#1e2e3e', bright: '#344e6e' },
+  'Seven seas (open ocean)': { fill: '#060e1a', bright: '#0e2238' },
 };
 const CONTINENT_FILL_DEF = '#101e2e';
+
+// ── Country helpers (used for political view info panel) ─────────────────────
+export function flagEmoji(iso2) {
+  if (!iso2 || iso2 === '-99' || iso2.length !== 2) return '';
+  try {
+    return [...iso2.toUpperCase()]
+      .map(c => String.fromCodePoint(c.charCodeAt(0) - 65 + 0x1F1E6))
+      .join('');
+  } catch { return ''; }
+}
+
+export function fmtPop(n) {
+  if (!n || n <= 0) return '—';
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + ' B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + ' M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + ' K';
+  return String(n);
+}
 
 // ── Region ID key helper ────────────────────────────────────────────────────
 const _toKey = id => id.replace(/^reg_/, '');
@@ -303,12 +321,14 @@ function _withAlpha(color, alpha) {
 
 export class MapView {
   /**
-   * @param {HTMLElement} container  — div that globe.gl will render into
-   * @param {Function}    onSelect   — called with (region|null) on click
+   * @param {HTMLElement} container         — div that globe.gl will render into
+   * @param {Function}    onSelect          — called with (region|null) on click
+   * @param {Function}    onCountrySelect   — called with (countryProps|null) on political-view country click
    */
-  constructor(container, onSelect) {
-    this._container     = container;
-    this.onSelect       = onSelect;
+  constructor(container, onSelect, onCountrySelect = null) {
+    this._container       = container;
+    this.onSelect         = onSelect;
+    this._onCountrySelect = onCountrySelect;
     this._world           = null;
     this._seeds           = null;
     this._geoKeys         = null;
@@ -320,6 +340,8 @@ export class MapView {
     this._factionColors   = {};
     this._selected        = null;
     this._hovered         = null;
+    this._countryHovered  = null;
+    this._countrySelected = null;
     this._view            = 'political';
 
     const G = window.Globe;
@@ -349,13 +371,21 @@ export class MapView {
       .onPolygonClick(polygon => {
         if (!polygon) return;
         if (polygon.properties._isCountry) {
-          // Click on country background → deselect game region
-          if (this._selected !== null) {
+          if (this._view === 'political' && this._onCountrySelect) {
+            this._countrySelected = polygon.properties.ADM0_A3;
+            this._refresh();
+            this._onCountrySelect(polygon.properties);
+          } else if (this._selected !== null) {
             this._selected = null;
             this._refresh();
             this.onSelect(null);
           }
           return;
+        }
+        // Game region clicked — clear country selection
+        if (this._countrySelected !== null) {
+          this._countrySelected = null;
+          if (this._onCountrySelect) this._onCountrySelect(null);
         }
         const region = this._regById[polygon.properties.id];
         if (region) {
@@ -366,21 +396,34 @@ export class MapView {
       })
       .onPolygonHover(polygon => {
         if (polygon?.properties?._isCountry) {
-          if (this._hovered !== null) { this._hovered = null; this._refresh(); }
+          const cid = polygon.properties.ADM0_A3;
+          const changed = cid !== this._countryHovered || this._hovered !== null;
+          this._countryHovered = cid;
+          this._hovered = null;
+          if (changed) this._refresh();
           return;
         }
+        const hadCountryHov = this._countryHovered !== null;
+        this._countryHovered = null;
         const id = polygon?.properties?.id ?? null;
-        if (id !== this._hovered) {
+        if (id !== this._hovered || hadCountryHov) {
           this._hovered = id;
           this._refresh();
         }
       })
       .onGlobeClick(() => {
+        let changed = false;
         if (this._selected !== null) {
           this._selected = null;
-          this._refresh();
           this.onSelect(null);
+          changed = true;
         }
+        if (this._countrySelected !== null) {
+          this._countrySelected = null;
+          if (this._onCountrySelect) this._onCountrySelect(null);
+          changed = true;
+        }
+        if (changed) this._refresh();
       })
       // Labels
       .labelsData([])
@@ -490,11 +533,19 @@ export class MapView {
 
   deselect() {
     this._selected = null;
+    if (this._countrySelected !== null) {
+      this._countrySelected = null;
+      if (this._onCountrySelect) this._onCountrySelect(null);
+    }
     this._refresh();
   }
 
   setView(mode) {
     if (!['political','population','unrest','prosperity'].includes(mode)) return;
+    if (this._view === 'political' && mode !== 'political' && this._countrySelected !== null) {
+      this._countrySelected = null;
+      if (this._onCountrySelect) this._onCountrySelect(null);
+    }
     this._view = mode;
     this._refresh();
   }
@@ -525,8 +576,11 @@ export class MapView {
     // Country background layer — visible only in political view
     if (p._isCountry) {
       if (this._view !== 'political') return 'rgba(0,0,0,0)';
-      const fill = CONTINENT_FILL[p.CONTINENT] ?? CONTINENT_FILL_DEF;
-      return fill + 'cc'; // ~80% opacity
+      const pal = CONTINENT_PALETTE[p.CONTINENT];
+      const fill = pal?.fill ?? CONTINENT_FILL_DEF;
+      if (p.ADM0_A3 === this._countrySelected) return (pal?.bright ?? '#304050') + 'ee';
+      if (p.ADM0_A3 === this._countryHovered)  return (pal?.bright ?? '#304050') + '88';
+      return fill + 'cc';
     }
 
     const isSel = p.id === this._selected;
@@ -561,7 +615,11 @@ export class MapView {
 
   _strokeColor(d) {
     if (d.properties?._isCountry) {
-      return this._view === 'political' ? '#0a1828' : 'rgba(0,0,0,0)';
+      if (this._view !== 'political') return 'rgba(0,0,0,0)';
+      const p = d.properties;
+      if (p.ADM0_A3 === this._countrySelected) return '#ffffff';
+      if (p.ADM0_A3 === this._countryHovered)  return CONTINENT_PALETTE[p.CONTINENT]?.bright ?? '#4a6088';
+      return '#0a1828';
     }
     const id = d.properties?.id;
     if (id === this._selected) return COL_BORDER_SEL;
@@ -570,7 +628,24 @@ export class MapView {
   }
 
   _tooltip(d) {
-    if (d.properties?._isCountry) return '';
+    const p = d.properties;
+    if (p?._isCountry) {
+      if (this._view !== 'political') return '';
+      const pal = CONTINENT_PALETTE[p.CONTINENT] ?? { bright: '#3a5060' };
+      return `
+        <div style="font-family:'Courier New',monospace;font-size:11px;
+                    background:rgba(3,6,14,0.96);border:1px solid #152235;
+                    border-left:2px solid ${pal.bright};padding:8px 12px;
+                    color:#a8c8e0;white-space:nowrap;letter-spacing:0.05em">
+          <div style="font-size:13px;color:#d8ecff;font-weight:bold;margin-bottom:4px">
+            ${flagEmoji(p.ISO_A2)}&nbsp;${p.NAME ?? p.ADMIN ?? '—'}
+          </div>
+          <div style="color:#38506a;font-size:9px;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:4px">
+            ${p.CONTINENT ?? ''}
+          </div>
+          <div style="color:#f0a03a">${fmtPop(p.POP_EST)}</div>
+        </div>`;
+    }
     const r = this._regById[d.properties?.id];
     if (!r) return d.properties?.name ?? '';
     const pop = (r.population ?? 0) >= 1000
@@ -587,7 +662,9 @@ export class MapView {
   }
 
   _altOf(d) {
-    if (d.properties?._isCountry) return 0;
+    if (d.properties?._isCountry) {
+      return d.properties.ADM0_A3 === this._countrySelected ? 0.006 : 0;
+    }
     const id = d.properties?.id;
     if (id === this._selected) return 0.012;
     return 0.001;

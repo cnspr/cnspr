@@ -9,7 +9,7 @@ import { GitHubClient, AuthError } from './github.js';
 import { MusicPlayer, MOODS }  from './musicplayer.js';
 import { YTMusicPlayer, MusicLibrary, YouTubePlayer, YouTubeSearchService, MOOD_QUERIES } from './youtubemusic.js';
 import { dbg, initDebugPanel } from './debug.js';
-import { MapView }      from './mapview.js';
+import { MapView, CONTINENT_PALETTE, flagEmoji, fmtPop } from './mapview.js';
 import { EventViewer }  from './eventviewer.js';
 import { StatsPanel }   from './statspanel.js';
 import { OrdersPanel }  from './orderspanel.js';
@@ -225,12 +225,45 @@ function initApp() {
     (type, params) => ordersPanel.addOrder(type, params),
   );
 
+  // ── Continent legend ──────────────────────────────────────────────────────
+  const legendEl = document.getElementById('continent-legend');
+  const clItems  = document.getElementById('cl-items');
+  for (const [name, c] of Object.entries(CONTINENT_PALETTE)) {
+    if (name.includes('seas') || name === 'Antarctica') continue;
+    const row = document.createElement('div');
+    row.className = 'cl-item';
+    row.innerHTML = `<div class="cl-swatch" style="background:${c.fill};border:1px solid ${c.bright}"></div><span>${name}</span>`;
+    clItems.appendChild(row);
+  }
+
+  // ── Country info panel ────────────────────────────────────────────────────
+  const countryPanelEl = document.getElementById('country-info-panel');
+
+  function showCountryPanel(props) {
+    const pal = CONTINENT_PALETTE[props.CONTINENT] ?? { bright: '#3a5060' };
+    document.getElementById('cip-flag').textContent    = flagEmoji(props.ISO_A2);
+    document.getElementById('cip-name').textContent    = props.NAME ?? props.ADMIN ?? '—';
+    document.getElementById('cip-continent').innerHTML =
+      `<span class="cip-dot" style="background:${pal.bright}"></span>${props.CONTINENT ?? '—'}`;
+    document.getElementById('cip-pop').textContent     = fmtPop(props.POP_EST);
+    document.getElementById('cip-long').textContent    = props.NAME_LONG ?? props.ADMIN ?? '—';
+    document.getElementById('cip-sov').textContent     = props.SOVEREIGNT ?? '—';
+    countryPanelEl.classList.add('visible');
+  }
+
+  function hideCountryPanel() {
+    countryPanelEl.classList.remove('visible');
+  }
+
   // Map view toolbar
   document.querySelectorAll('.map-view-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.map-view-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       mapView?.setView(btn.dataset.view);
+      const isPolitical = btn.dataset.view === 'political';
+      legendEl.classList.toggle('hidden', !isPolitical);
+      if (!isPolitical) hideCountryPanel();
     });
   });
 
@@ -246,6 +279,10 @@ function initApp() {
         regionOrdersPanel.hide();
         mapSelectionEl.classList.remove('open');
       }
+    },
+    (countryProps) => {
+      if (countryProps) showCountryPanel(countryProps);
+      else hideCountryPanel();
     },
   );
 

@@ -66,6 +66,27 @@
         <button class="map-view-btn" data-view="unrest">Unrest</button>
         <button class="map-view-btn" data-view="prosperity">Prosperity</button>
       </div>
+
+      <!-- Country info panel (political view, shown on country click) -->
+      <div id="country-info-panel" class="country-info-panel">
+        <div class="cip-header">
+          <span class="cip-flag" id="cip-flag"></span>
+          <span class="cip-name" id="cip-name"></span>
+        </div>
+        <div class="cip-body">
+          <div class="cip-row"><span class="cip-key">Continent</span><span class="cip-val" id="cip-continent"></span></div>
+          <div class="cip-row"><span class="cip-key">Population</span><span class="cip-val cip-amber" id="cip-pop"></span></div>
+          <div class="cip-row"><span class="cip-key">Full name</span><span class="cip-val cip-small" id="cip-long"></span></div>
+          <div class="cip-row"><span class="cip-key">Sovereignty</span><span class="cip-val cip-green" id="cip-sov"></span></div>
+        </div>
+      </div>
+
+      <!-- Continent legend (political view only) -->
+      <div id="continent-legend" class="continent-legend">
+        <div class="cl-title">Continent</div>
+        <div id="cl-items"></div>
+      </div>
+
       <div id="map-canvas"></div>
       <div id="map-selection" class="map-selection">
         <!-- Left panel: context-aware orders for the selected region -->
